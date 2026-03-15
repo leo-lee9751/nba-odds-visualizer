@@ -78,11 +78,18 @@
     </div>
   </div>
 
-  <main class="main">
-    <div class="games-table-wrapper" id="gamesTableWrapper">
-      <div class="loading" id="mainLoading">Loading odds…</div>
-    </div>
-  </main>
+  <div class="layout-with-sidebar">
+    <main class="main">
+      <div class="games-table-wrapper" id="gamesTableWrapper">
+        <div class="loading" id="mainLoading">Loading odds…</div>
+      </div>
+    </main>
+    <aside class="dashboard-sidebar" id="dashboardSidebar">
+      <h3 class="dashboard-title">My orders</h3>
+      <p class="dashboard-hint" id="dashboardHint">Sign in to see your Polymarket and Kalshi orders.</p>
+      <div class="dashboard-content" id="dashboardContent" hidden></div>
+    </aside>
+  </div>
 
   <script src="app.js"></script>
 </body>

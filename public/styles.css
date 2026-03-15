@@ -207,10 +207,71 @@ body {
   to { transform: rotate(360deg); }
 }
 
+.layout-with-sidebar {
+  display: flex;
+  gap: 0;
+  min-height: calc(100vh - 70px);
+}
 .main {
+  flex: 1;
   padding: 1.5rem 2rem;
   max-width: 1400px;
   margin: 0 auto;
+  min-width: 0;
+}
+.dashboard-sidebar {
+  width: 320px;
+  min-width: 280px;
+  padding: 1.25rem 1rem;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+}
+.dashboard-title {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: var(--text);
+}
+.dashboard-hint {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 0.75rem;
+}
+.dashboard-content {
+  font-size: 0.85rem;
+}
+.dashboard-section {
+  margin-bottom: 1.25rem;
+}
+.dashboard-section h4 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+.dashboard-order-card {
+  padding: 0.65rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+}
+.dashboard-order-card .order-game {
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+.dashboard-order-card .order-detail {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+.dashboard-order-card.poly { border-left: 3px solid var(--accent-poly); }
+.dashboard-order-card.kalshi { border-left: 3px solid var(--accent-kalshi); }
+.dashboard-order-card .order-status {
+  font-size: 0.75rem;
+  margin-top: 0.25rem;
+  color: var(--text-muted);
 }
 
 .games-table-wrapper {
