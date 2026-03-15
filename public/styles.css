@@ -1,0 +1,430 @@
+:root {
+  --bg: #0d0f14;
+  --surface: #161a22;
+  --surface-hover: #1c212b;
+  --border: #2a3140;
+  --text: #e6e9f0;
+  --text-muted: #8b92a8;
+  --accent-poly: #6366f1;
+  --accent-kalshi: #f59e0b;
+  --prob-high: #22c55e;
+  --prob-low: #64748b;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Outfit', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+.header {
+  padding: 1.5rem 2rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.header h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.subtitle {
+  color: var(--text-muted);
+  font-size: 0.95rem;
+}
+
+.auth-area {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-left: auto;
+  margin-right: 0.75rem;
+}
+
+.auth-btn {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.auth-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--text-muted);
+}
+
+.auth-btn-outline {
+  background: transparent;
+}
+
+.auth-status {
+  font-size: 0.8rem;
+  color: var(--prob-high);
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-overlay[hidden] {
+  display: none !important;
+}
+
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem;
+  min-width: 320px;
+  max-width: 90vw;
+}
+
+.modal h3 {
+  margin-bottom: 0.5rem;
+  font-size: 1.1rem;
+}
+
+.modal-hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+}
+
+.auth-form label {
+  display: block;
+  margin-bottom: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.auth-form input,
+.auth-form select,
+.auth-form textarea {
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.auth-form textarea {
+  resize: vertical;
+  min-height: 80px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1.25rem;
+  justify-content: flex-end;
+}
+
+.bet-btn {
+  display: inline-block;
+  margin-top: 0.5rem;
+  padding: 0.35rem 0.65rem;
+  font-size: 0.8rem;
+  background: var(--accent-poly);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: opacity 0.2s;
+}
+
+.bet-btn:hover {
+  opacity: 0.9;
+}
+
+.col-kalshi .bet-btn {
+  background: var(--accent-kalshi);
+}
+
+.refresh-btn {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.refresh-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--text-muted);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.8;
+  cursor: wait;
+}
+
+.refresh-btn .refresh-icon {
+  display: inline-block;
+  transition: transform 0.2s ease;
+}
+
+.refresh-btn.is-refreshing .refresh-icon {
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.main {
+  padding: 1.5rem 2rem;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.games-table-wrapper {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: auto;
+  max-height: 75vh;
+}
+
+.games-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 520px;
+}
+
+.games-table th,
+.games-table td {
+  padding: 0.75rem 1rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.games-table th {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.games-table th.col-matchup { width: 32%; }
+.games-table th.col-poly { width: 34%; border-left: 1px solid var(--border); }
+.games-table th.col-kalshi { width: 34%; border-left: 1px solid var(--border); }
+
+.games-table td.col-poly { border-left: 1px solid var(--border); }
+.games-table td.col-kalshi { border-left: 1px solid var(--border); }
+
+.games-table th.col-poly { color: var(--accent-poly); }
+.games-table th.col-kalshi { color: var(--accent-kalshi); }
+
+.games-table tbody tr:hover {
+  background: var(--surface-hover);
+}
+
+.game-row .matchup-cell {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.game-row .matchup-cell a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.game-row .matchup-cell a:hover {
+  text-decoration: underline;
+}
+
+.odds-cell {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+}
+
+.odds-cell .odds-line {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.odds-cell .empty-odds {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.85rem;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.polymarket-panel .panel-header { border-left: 4px solid var(--accent-poly); }
+.kalshi-panel .panel-header { border-left: 4px solid var(--accent-kalshi); }
+
+.panel-header {
+  padding: 1rem 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.panel-header .favicon {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+}
+
+.panel-header h2 {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.games-list {
+  padding: 0.5rem;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.game-card {
+  padding: 1rem 1.25rem;
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+  transition: background 0.15s;
+}
+
+.game-card:hover {
+  background: var(--surface-hover);
+}
+
+.game-card a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.game-matchup {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin-bottom: 0.5rem;
+}
+
+.game-matchup .vs {
+  color: var(--text-muted);
+  font-weight: 400;
+  margin: 0 0.35rem;
+}
+
+.game-score {
+  margin: 0 0.5rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.game-status {
+  font-size: 0.75rem;
+  color: var(--prob-high);
+  margin-bottom: 0.35rem;
+}
+
+.market-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-weight: 400;
+  margin-left: 0.25rem;
+}
+
+.game-odds {
+  display: flex;
+  gap: 1rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+}
+
+.odds-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.odds-value {
+  font-weight: 600;
+  color: var(--prob-high);
+}
+
+.odds-value.low {
+  color: var(--prob-low);
+}
+
+.odds-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.game-date {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 0.35rem;
+}
+
+.matchup-score {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  margin: 0 0.35rem;
+}
+
+.matchup-status {
+  font-size: 0.75rem;
+  color: var(--prob-high);
+  margin-top: 0.2rem;
+}
+
+.loading, .error, .empty {
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.error {
+  color: #ef4444;
+}
+
+.empty {
+  font-style: italic;
+}

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NBA Odds Visualizer | Kalshi vs Polymarket</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>NBA Odds Visualizer</h1>
+    <p class="subtitle">Compare moneyline odds across Kalshi & Polymarket</p>
+    <div class="auth-area" id="authArea">
+      <button type="button" class="auth-btn" id="signInPolyBtn" title="Sign in to place bets on Polymarket">Sign in Polymarket</button>
+      <button type="button" class="auth-btn" id="signInKalshiBtn" title="Sign in to place bets on Kalshi">Sign in Kalshi</button>
+      <span class="auth-status" id="authStatus"></span>
+      <button type="button" class="auth-btn auth-btn-outline" id="logoutBtn" style="display:none;">Log out</button>
+    </div>
+    <button class="refresh-btn" id="refreshBtn" title="Refresh odds" type="button">
+      <span class="refresh-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M23 4v6h-6M1 20v-6h6"/>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+        </svg>
+      </span>
+      Refresh
+    </button>
+  </header>
+
+  <!-- Sign-in modals -->
+  <div class="modal-overlay" id="polySignInModal" hidden>
+    <div class="modal">
+      <h3>Sign in to Polymarket</h3>
+      <p class="modal-hint">Get API key from Polymarket (derive from wallet). Never share your private key.</p>
+      <form id="polySignInForm" class="auth-form">
+        <label>API Key <input type="text" name="apiKey" placeholder="UUID" required /></label>
+        <label>Secret <input type="password" name="secret" placeholder="Base64 secret" required /></label>
+        <label>Passphrase <input type="password" name="passphrase" required /></label>
+        <label>Private key (for signing orders) <input type="password" name="privateKey" placeholder="0x..." required /></label>
+        <div class="modal-actions">
+          <button type="button" class="auth-btn auth-btn-outline" id="closePolySignIn">Cancel</button>
+          <button type="submit" class="auth-btn">Sign in</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="modal-overlay" id="kalshiSignInModal" hidden>
+    <div class="modal">
+      <h3>Sign in to Kalshi</h3>
+      <p class="modal-hint">Create an API key at Kalshi → Account → API Keys. Save the private key when created.</p>
+      <form id="kalshiSignInForm" class="auth-form">
+        <label>API Key ID <input type="text" name="apiKeyId" placeholder="UUID" required /></label>
+        <label>Private key (PEM) <textarea name="privateKey" rows="4" placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;...&#10;-----END RSA PRIVATE KEY-----" required></textarea></label>
+        <div class="modal-actions">
+          <button type="button" class="auth-btn auth-btn-outline" id="closeKalshiSignIn">Cancel</button>
+          <button type="submit" class="auth-btn">Sign in</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Bet modal -->
+  <div class="modal-overlay" id="betModal" hidden>
+    <div class="modal">
+      <h3 id="betModalTitle">Place bet</h3>
+      <form id="betForm" class="auth-form">
+        <input type="hidden" name="platform" />
+        <input type="hidden" name="gameKey" />
+        <div id="betFormFields"></div>
+        <div class="modal-actions">
+          <button type="button" class="auth-btn auth-btn-outline" id="closeBetModal">Cancel</button>
+          <button type="submit" class="auth-btn">Place order</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <main class="main">
+    <div class="games-table-wrapper" id="gamesTableWrapper">
+      <div class="loading" id="mainLoading">Loading odds…</div>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
