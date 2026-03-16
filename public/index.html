@@ -80,6 +80,37 @@
 
   <div class="layout-with-sidebar">
     <main class="main">
+      <section class="live-panel" id="livePanel">
+        <h3 class="live-title">Live now</h3>
+        <div class="live-content" id="liveContent"></div>
+      </section>
+      <section class="arb-panel" id="arbPanel">
+        <h3 class="arb-title">Arb opportunities</h3>
+        <p class="arb-hint">Find risk-free arbitrage between Polymarket and Kalshi (NBA moneyline). Auto-refreshes every 0.5s. Sign in to both to place.</p>
+        <div class="arb-toolbar">
+          <button type="button" class="auth-btn auth-btn-outline" id="checkArbBtn">Check arb</button>
+          <span class="arb-checking-indicator" id="arbCheckingIndicator" hidden aria-live="polite">
+            <span class="arb-checking-dot"></span> Checking…
+          </span>
+        </div>
+        <div class="arb-content" id="arbContent" hidden></div>
+        <div class="arb-past-section" id="arbPastSection" hidden>
+          <h4 class="arb-past-title">Past arb opportunities</h4>
+          <div class="arb-past-content" id="arbPastContent"></div>
+        </div>
+      </section>
+      <section class="sim-panel" id="simPanel">
+        <h3 class="sim-title">Arb simulation</h3>
+        <p class="sim-hint">Start with $1000 on each platform; simulate taking every arb that appears (same arb can repeat after 3s).</p>
+        <div class="sim-toolbar">
+          <button type="button" class="auth-btn" id="simStartBtn">Start simulation</button>
+          <button type="button" class="auth-btn auth-btn-outline" id="simStopBtn" disabled>Stop</button>
+          <span class="sim-balances" id="simBalances"></span>
+        </div>
+        <div class="sim-chart-wrap">
+          <canvas id="simChart" width="800" height="280"></canvas>
+        </div>
+      </section>
       <div class="games-table-wrapper" id="gamesTableWrapper">
         <div class="loading" id="mainLoading">Loading odds…</div>
       </div>
@@ -91,6 +122,7 @@
     </aside>
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

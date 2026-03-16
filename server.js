@@ -122,6 +122,43 @@ app.get('/api/nba/upcoming', async (req, res) => {
   }
 });
 
+// Live games (in progress, not final)
+app.get('/api/nba/live', async (req, res) => {
+  try {
+    const now = new Date();
+    const live = [];
+    for (const date of [now, new Date(now.getTime() - 24 * 60 * 60 * 1000)]) {
+      const dateStr = date.toISOString().slice(0, 10);
+      const sbRes = await fetch(
+        `${NBA_SCOREBOARD_URL}?t=${Date.now()}&gameDate=${dateStr}`,
+        fetchOptions
+      );
+      const sb = await sbRes.json();
+      for (const g of sb?.scoreboard?.games || []) {
+        const startTime = g.gameTimeUTC ? new Date(g.gameTimeUTC) : null;
+        const hasStarted = startTime && startTime.getTime() < now.getTime();
+        const status = (g.gameStatusText || '').toLowerCase();
+        const isFinal = status.includes('final');
+        if (hasStarted && !isFinal) {
+          live.push({
+            awayTeam: g.awayTeam?.teamTricode || 'AWAY',
+            homeTeam: g.homeTeam?.teamTricode || 'HOME',
+            awayScore: g.awayTeam?.score ?? 0,
+            homeScore: g.homeTeam?.score ?? 0,
+            gameStatusText: g.gameStatusText || '',
+            period: g.period,
+            url: `https://www.nba.com/game/${g.awayTeam?.teamTricode || 'AWAY'}-vs-${g.homeTeam?.teamTricode || 'HOME'}-${g.gameId}`,
+          });
+        }
+      }
+    }
+    res.json({ games: live });
+  } catch (err) {
+    console.error('NBA live error:', err.message);
+    res.status(500).json({ error: err.message, games: [] });
+  }
+});
+
 // Polymarket NBA tag_id: 745 (from sports metadata - NBA sport has tags "1,745,100639")
 const POLYMARKET_NBA_TAG = '745';
 
@@ -171,6 +208,62 @@ function parseOutcomes(val) {
     } catch {
       return [];
     }
+  }
+  return [];
+}
+
+// Normalize a Polymarket CLOB token ID to digits-only (handles stringified JSON array or stray quotes/brackets)
+function normalizePolyTokenId(val) {
+  if (val == null) return '';
+  if (Array.isArray(val)) return normalizePolyTokenId(val[0]);
+  let s = String(val).trim();
+  try {
+    if (s.startsWith('[')) {
+      const arr = JSON.parse(s);
+      return Array.isArray(arr) && arr[0] != null ? normalizePolyTokenId(arr[0]) : s.replace(/\D/g, '');
+    }
+  } catch (_) {}
+  return s.replace(/\D/g, '') || s;
+}
+
+// Extract [awayToken, homeToken] from market or event; Gamma API can use clobTokenIds, tokens, or one token per market in multi-outcome events
+function parseMarketTokenIds(market, event, awayTeam, homeTeam) {
+  let tokenIds = market?.clobTokenIds ?? market?.tokens;
+  if (typeof tokenIds === 'string') {
+    try {
+      if (tokenIds.trim().startsWith('[')) tokenIds = JSON.parse(tokenIds);
+      else tokenIds = tokenIds.split(',').map((s) => s.trim()).filter(Boolean);
+    } catch (_) {
+      tokenIds = tokenIds.split(',').map((s) => s.trim()).filter(Boolean);
+    }
+  }
+  if (Array.isArray(tokenIds) && tokenIds.length >= 2) {
+    return [normalizePolyTokenId(tokenIds[0]), normalizePolyTokenId(tokenIds[1])].filter(Boolean);
+  }
+  const markets = event?.markets || [];
+  let awayToken = null;
+  let homeToken = null;
+  for (const m of markets) {
+    const title = (m.groupItemTitle || m.question || m.title || '').toLowerCase();
+    if (/spread|total|over|under|points|margin|o\/u/i.test(title)) continue;
+    const ids = m?.clobTokenIds ?? m?.tokens;
+    let arr = Array.isArray(ids) ? ids : [];
+    if (typeof ids === 'string') {
+      try {
+        arr = ids.trim().startsWith('[') ? JSON.parse(ids) : ids.split(',').map((s) => s.trim()).filter(Boolean);
+      } catch (_) {
+        arr = ids.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+    }
+    if (arr.length === 0) continue;
+    const firstToken = normalizePolyTokenId(arr[0]);
+    if (!firstToken) continue;
+    const titleUpper = (m.groupItemTitle || m.question || m.title || '').toUpperCase();
+    if (titleUpper.includes(String(awayTeam).toUpperCase()) && !titleUpper.includes(String(homeTeam).toUpperCase())) awayToken = firstToken;
+    else if (titleUpper.includes(String(homeTeam).toUpperCase()) && !titleUpper.includes(String(awayTeam).toUpperCase())) homeToken = firstToken;
+    else if (!awayToken) awayToken = firstToken;
+    else if (!homeToken) homeToken = firstToken;
+    if (awayToken && homeToken) return [awayToken, homeToken];
   }
   return [];
 }
@@ -278,8 +371,7 @@ app.get('/api/polymarket', async (req, res) => {
 
           const { awayOdds, homeOdds } = mapPricesToAwayHome(prices, outcomes, event, awayTeam, homeTeam);
 
-          const tokenIds = market?.clobTokenIds ?? market?.tokens;
-          const tokenIdArr = Array.isArray(tokenIds) ? tokenIds : [];
+          const tokenIdArr = parseMarketTokenIds(market, event, awayTeam, homeTeam);
           const tickSize = market?.minimum_tick_size ?? market?.tickSize ?? '0.01';
           const negRisk = Boolean(market?.neg_risk ?? market?.negRisk);
           const betting =
@@ -313,10 +405,19 @@ app.get('/api/polymarket', async (req, res) => {
 const KALSHI_ELECTIONS = 'https://api.elections.kalshi.com/trade-api/v2';
 const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
 
-// Parse "DEN at LAL (Mar 14)" or "GSW at NYK (Mar 15)" -> away, home
+// Parse "DEN at LAL (Mar 14)" or "GSW at NYK (Mar 15)" -> away, home (can be full city names)
 function parseKalshiSubtitle(sub) {
   const m = (sub || '').match(/([A-Za-z]+)\s+at\s+([A-Za-z]+)\s+\(/);
   return m ? { away: m[1].toUpperCase(), home: m[2].toUpperCase() } : null;
+}
+
+// Event ticker is KXNBAGAME-26MAR15PORPHI (YYMMMDD + away 3 + home 3). Use this so keys match NBA tricodes (POR-PHI).
+function parseKalshiEventTicker(eventTicker) {
+  const suffix = (eventTicker || '').split('-')[1] || '';
+  if (suffix.length < 13) return null; // YYMMMDD = 7, then 6 for teams
+  const teamPart = suffix.slice(7);
+  if (teamPart.length < 6) return null;
+  return { away: teamPart.slice(0, 3), home: teamPart.slice(3, 6) };
 }
 
 // Build Kalshi event_ticker for NBA game: KXNBAGAME-26MAR15GSWNYK (YYMMMDD away home)
@@ -371,7 +472,8 @@ app.get('/api/kalshi', async (req, res) => {
 
     const gamesByKey = new Map();
     for (const event of events) {
-      const teams = parseKalshiSubtitle(event.sub_title);
+      let teams = parseKalshiEventTicker(event.event_ticker);
+      if (!teams) teams = parseKalshiSubtitle(event.sub_title);
       if (!teams) continue;
 
       const marketsRes = await fetch(
@@ -381,7 +483,7 @@ app.get('/api/kalshi', async (req, res) => {
       const { markets = [] } = await marketsRes.json();
       if (markets.length < 2) continue;
 
-      const marketFor = (code) => markets.find((m) => (m.ticker || '').endsWith('-' + code));
+      const marketFor = (code) => markets.find((m) => (m.ticker || '').toUpperCase().endsWith('-' + code));
       const homeM = marketFor(teams.home);
       const awayM = marketFor(teams.away);
       if (!homeM || !awayM) continue;
@@ -503,6 +605,200 @@ app.get('/api/kalshi', async (req, res) => {
   }
 });
 
+// ---------- Arbitrage (design: docs/ARBITRAGE_DESIGN.md) ----------
+const ARB_MIN_PROFIT_USD = Number(process.env.ARB_MIN_PROFIT_USD) || 0.5;
+const ARB_MAX_STAKE_USD = Number(process.env.ARB_MAX_STAKE_USD) || 20;
+const ARB_MAX_STAKE_PER_ARB_USD = Number(process.env.ARB_MAX_STAKE_PER_ARB_USD) || ARB_MAX_STAKE_USD; // cap per arb so you can place multiple
+const ARB_RESERVE_POLY_USD = Number(process.env.ARB_RESERVE_POLY_USD) || 20;
+const ARB_RESERVE_KAL_USD = Number(process.env.ARB_RESERVE_KAL_USD) || 20;
+const KALSHI_TAKER_FEE = 0.07; // 0.07 * C * P * (1-P) per contract
+
+function gameKey(away, home) {
+  return `${String(away).toUpperCase()}-${String(home).toUpperCase()}`;
+}
+
+function detectArbOpportunities(polyGames, kalshiGames, balances) {
+  const opportunities = [];
+  const byKey = new Map();
+  for (const g of kalshiGames) byKey.set(gameKey(g.awayTeam, g.homeTeam), g);
+  const availPoly = balances?.polymarket?.balanceUsdc != null ? Math.max(0, balances.polymarket.balanceUsdc - ARB_RESERVE_POLY_USD) : ARB_MAX_STAKE_USD;
+  const availKal = balances?.kalshi?.balanceCents != null ? Math.max(0, (balances.kalshi.balanceCents / 100) - ARB_RESERVE_KAL_USD) : ARB_MAX_STAKE_USD;
+
+  for (const poly of polyGames) {
+    const key = gameKey(poly.awayTeam, poly.homeTeam);
+    const kal = byKey.get(key);
+    if (!kal || !poly.tokenIdHome || !poly.tokenIdAway) continue;
+
+    const p_H_poly = Math.max(0.01, Math.min(0.99, Number(poly.homeOdds) || 0.5));
+    const p_A_poly = Math.max(0.01, Math.min(0.99, Number(poly.awayOdds) || 0.5));
+    const p_H_kal = Math.max(0.01, Math.min(0.99, Number(kal.homeOdds) || 0.5));
+    const p_A_kal = Math.max(0.01, Math.min(0.99, Number(kal.awayOdds) || 0.5));
+
+    // Strategy 1: Home on Poly, Away on Kalshi. Arb if p_H_poly + p_A_kal < 1
+    const sum1 = p_H_poly + p_A_kal;
+    if (sum1 < 1) {
+      const idealStake = Math.min(ARB_MAX_STAKE_USD, ARB_MAX_STAKE_PER_ARB_USD);
+      let x = Math.min(idealStake, availPoly, (availKal * p_H_poly) / p_A_kal);
+      x = Math.max(0, Math.min(x, ARB_MAX_STAKE_PER_ARB_USD));
+      const y = (x * p_A_kal) / p_H_poly;
+      if (y > availKal) continue;
+      const K = x / p_H_poly;
+      const C = x + y;
+      const contractsKal = Math.floor((y * 100) / Math.round(p_A_kal * 100));
+      const feeKal = KALSHI_TAKER_FEE * contractsKal * p_A_kal * (1 - p_A_kal);
+      const netProfit = K - C - feeKal;
+      if (netProfit >= ARB_MIN_PROFIT_USD) {
+        opportunities.push({
+          gameKey: key,
+          awayTeam: poly.awayTeam,
+          homeTeam: poly.homeTeam,
+          strategy: 1,
+          strategyLabel: `Home (${poly.homeTeam}) on Poly, Away (${poly.awayTeam}) on Kalshi`,
+          stakePolyUsd: Math.round(x * 100) / 100,
+          stakeKalshiUsd: Math.round(y * 100) / 100,
+          polyPrice: p_H_poly,
+          kalshiPrice: p_A_kal,
+          polyTokenId: poly.tokenIdHome,
+          polySide: 'BUY',
+          kalshiTicker: kal.marketTickerAway,
+          kalshiSide: 'yes',
+          kalshiYesPriceCents: Math.round(p_A_kal * 100),
+          kalshiCount: contractsKal,
+          netProfitUsd: Math.round(netProfit * 100) / 100,
+          feeUsd: Math.round(feeKal * 100) / 100,
+          polyTickSize: poly.tickSize || '0.01',
+          polyNegRisk: Boolean(poly.negRisk),
+        });
+      }
+    }
+
+    // Strategy 2: Away on Poly, Home on Kalshi. Arb if p_A_poly + p_H_kal < 1
+    const sum2 = p_A_poly + p_H_kal;
+    if (sum2 < 1) {
+      const idealStake = Math.min(ARB_MAX_STAKE_USD, ARB_MAX_STAKE_PER_ARB_USD);
+      let x = Math.min(idealStake, availPoly, (availKal * p_A_poly) / p_H_kal);
+      x = Math.max(0, Math.min(x, ARB_MAX_STAKE_PER_ARB_USD));
+      const y = (x * p_H_kal) / p_A_poly;
+      if (y > availKal) continue;
+      const K = x / p_A_poly;
+      const C = x + y;
+      const contractsKal = Math.floor((y * 100) / Math.round(p_H_kal * 100));
+      const feeKal = KALSHI_TAKER_FEE * contractsKal * p_H_kal * (1 - p_H_kal);
+      const netProfit = K - C - feeKal;
+      if (netProfit >= ARB_MIN_PROFIT_USD) {
+        opportunities.push({
+          gameKey: key,
+          awayTeam: poly.awayTeam,
+          homeTeam: poly.homeTeam,
+          strategy: 2,
+          strategyLabel: `Away (${poly.awayTeam}) on Poly, Home (${poly.homeTeam}) on Kalshi`,
+          stakePolyUsd: Math.round(x * 100) / 100,
+          stakeKalshiUsd: Math.round(y * 100) / 100,
+          polyPrice: p_A_poly,
+          kalshiPrice: p_H_kal,
+          polyTokenId: poly.tokenIdAway,
+          polySide: 'BUY',
+          kalshiTicker: kal.marketTickerHome,
+          kalshiSide: 'yes',
+          kalshiYesPriceCents: Math.round(p_H_kal * 100),
+          kalshiCount: contractsKal,
+          netProfitUsd: Math.round(netProfit * 100) / 100,
+          feeUsd: Math.round(feeKal * 100) / 100,
+          polyTickSize: poly.tickSize || '0.01',
+          polyNegRisk: Boolean(poly.negRisk),
+        });
+      }
+    }
+  }
+  return opportunities;
+}
+
+app.get('/api/arb/opportunities', async (req, res) => {
+  try {
+    const base = `${req.protocol}://${req.get('host')}`;
+    const cookie = req.headers.cookie || '';
+    const [polyRes, kalshiRes, balancesRes] = await Promise.all([
+      fetch(`${base}/api/polymarket`, { headers: { cookie } }),
+      fetch(`${base}/api/kalshi`, { headers: { cookie } }),
+      req.session?.polyCreds || req.session?.kalshiCreds ? fetch(`${base}/api/balances`, { headers: { cookie } }) : Promise.resolve(null),
+    ]);
+    const polyData = await polyRes.json().catch(() => ({ games: [] }));
+    const kalshiData = await kalshiRes.json().catch(() => ({ games: [] }));
+    let balances = null;
+    if (balancesRes && balancesRes.ok) balances = await balancesRes.json().catch(() => null);
+    const polyGames = polyData.games || [];
+    const kalshiGames = kalshiData.games || [];
+    const opportunities = detectArbOpportunities(polyGames, kalshiGames, balances);
+    res.json({ opportunities, config: { minProfitUsd: ARB_MIN_PROFIT_USD, maxStakeUsd: ARB_MAX_STAKE_USD, maxStakePerArbUsd: ARB_MAX_STAKE_PER_ARB_USD } });
+  } catch (err) {
+    console.error('Arb opportunities error:', err.message);
+    res.status(500).json({ error: err.message, opportunities: [] });
+  }
+});
+
+app.post('/api/arb/execute', async (req, res) => {
+  const credsPoly = req.session?.polyCreds;
+  const credsKal = req.session?.kalshiCreds;
+  if (!credsPoly || !credsKal) {
+    return res.status(401).json({ error: 'Sign in to both Polymarket and Kalshi to place arb' });
+  }
+  const opp = req.body;
+  if (!opp || !opp.gameKey || !opp.polyTokenId || !opp.kalshiTicker) {
+    return res.status(400).json({ error: 'Invalid opportunity: need gameKey, polyTokenId, kalshiTicker, stakePolyUsd, kalshiCount, etc.' });
+  }
+
+  const stakePoly = Number(opp.stakePolyUsd) || 0;
+  const polyPrice = Number(opp.polyPrice) || 0.5;
+  const polySize = Math.max(1, Math.floor(stakePoly / Math.max(0.01, polyPrice)));
+
+  try {
+    const base = `${req.protocol}://${req.get('host')}`;
+    const cookie = req.headers.cookie || '';
+
+    const polyOrderRes = await fetch(`${base}/api/polymarket/order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie },
+      body: JSON.stringify({
+        tokenId: opp.polyTokenId,
+        side: opp.polySide || 'BUY',
+        price: polyPrice,
+        size: polySize,
+        tickSize: opp.polyTickSize || '0.01',
+        negRisk: opp.polyNegRisk || false,
+      }),
+    });
+    const polyResult = await polyOrderRes.json().catch(() => ({}));
+    if (!polyOrderRes.ok) {
+      return res.status(polyOrderRes.status).json({ error: polyResult.error || 'Polymarket order failed' });
+    }
+
+    const kalshiOrderRes = await fetch(`${base}/api/kalshi/order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie },
+      body: JSON.stringify({
+        ticker: opp.kalshiTicker,
+        side: opp.kalshiSide || 'yes',
+        count: Math.max(1, Number(opp.kalshiCount) || 1),
+        yes_price: Math.min(99, Math.max(1, Number(opp.kalshiYesPriceCents) || 50)),
+        client_order_id: crypto.randomUUID(),
+      }),
+    });
+    const kalshiResult = await kalshiOrderRes.json().catch(() => ({}));
+    if (!kalshiOrderRes.ok) {
+      return res.status(kalshiOrderRes.status).json({
+        error: 'Kalshi order failed after Poly leg filled. Cancel the Poly order or hedge on Kalshi. ' + (kalshiResult.error || ''),
+        leg1Done: true,
+        polyResult,
+      });
+    }
+
+    res.json({ ok: true, poly: polyResult, kalshi: kalshiResult });
+  } catch (err) {
+    console.error('Arb execute error:', err);
+    res.status(500).json({ error: err.message || 'Arb execute failed' });
+  }
+});
+
 // Combined endpoint - fetches both and tries to match games
 app.get('/api/odds', async (req, res) => {
   try {
@@ -568,18 +864,30 @@ app.get('/api/balances', async (req, res) => {
       const { Wallet } = await import('ethers');
       const creds = req.session.polyCreds;
       const wallet = new Wallet(creds.privateKey);
-      const apiCreds = { apiKey: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase };
-      const client = new ClobClient(
-        'https://clob.polymarket.com',
-        137,
-        wallet,
-        apiCreds,
-        0,
-        wallet.address
-      );
-      const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-      const balanceWei = BigInt(bal?.balance ?? 0);
-      result.polymarket = { balanceUsdc: Number(balanceWei) / 1e6 };
+      const apiCreds = { key: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase };
+      let balanceUsdc = 0;
+      // Polymarket uses signature_type: 0=EOA, 1=Email/Magic, 2=Browser proxy. Try all if first returns 0.
+      for (const sigType of [0, 1, 2]) {
+        const client = new ClobClient(
+          'https://clob.polymarket.com',
+          137,
+          wallet,
+          apiCreds,
+          sigType,
+          wallet.address
+        );
+        const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        const balanceWei = BigInt(bal?.balance ?? 0);
+        const usdc = Number(balanceWei) / 1e6;
+        if (usdc > 0) {
+          balanceUsdc = usdc;
+          break;
+        }
+      }
+      result.polymarket = {
+        balanceUsdc,
+        ...(balanceUsdc === 0 && { hint: 'Balance is 0. Ensure your deposit is in the wallet linked to your API key (Polygon USDC). If you use Email sign-in on Polymarket, the API key must be derived from that same account.' }),
+      };
     } catch (err) {
       console.error('Polymarket balance error:', err.message);
       result.polymarket = { error: err.message };
@@ -633,7 +941,7 @@ app.get('/api/my-orders', async (req, res) => {
       const { Wallet } = await import('ethers');
       const creds = req.session.polyCreds;
       const wallet = new Wallet(creds.privateKey);
-      const apiCreds = { apiKey: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase };
+      const apiCreds = { key: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase };
       const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, 0, wallet.address);
       const orders = await client.getOpenOrders({}, true) || [];
       result.polymarket.orders = orders.map((o) => ({
@@ -720,6 +1028,15 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+// Polymarket SDK only supports these tick sizes (ROUNDING_CONFIG keys). Use smallest supported >= market min.
+const POLY_SUPPORTED_TICK_SIZES = ['0.0001', '0.001', '0.01', '0.1'];
+function polyTickSizeSupported(minTickStr) {
+  const min = parseFloat(minTickStr);
+  if (!Number.isFinite(min)) return '0.01';
+  const found = POLY_SUPPORTED_TICK_SIZES.find((s) => parseFloat(s) >= min);
+  return found || '0.1';
+}
+
 // Place order on Polymarket (requires session polyCreds)
 app.post('/api/polymarket/order', async (req, res) => {
   const creds = req.session?.polyCreds;
@@ -735,7 +1052,7 @@ app.post('/api/polymarket/order', async (req, res) => {
     const { Wallet } = await import('ethers');
 
     const wallet = new Wallet(creds.privateKey);
-    const apiCreds = { apiKey: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase };
+    const apiCreds = { key: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase };
     const client = new ClobClient(
       'https://clob.polymarket.com',
       137,
@@ -745,19 +1062,28 @@ app.post('/api/polymarket/order', async (req, res) => {
       wallet.address
     );
 
-    const tickSize = String(req.body.tickSize ?? '0.01');
+    const tokenIdStr = normalizePolyTokenId(tokenId) || String(tokenId).trim();
+    if (!tokenIdStr) return res.status(400).json({ error: 'Invalid or missing token id' });
+    let tickSize = String(req.body.tickSize ?? '0.01');
+    try {
+      const minTick = await client.getTickSize(tokenIdStr);
+      if (minTick && typeof minTick === 'string') tickSize = polyTickSizeSupported(minTick);
+    } catch (_) {
+      // keep request tickSize if getTickSize fails (e.g. 400 invalid token)
+    }
     const negRisk = Boolean(req.body.negRisk);
     const sideVal = (side || '').toUpperCase() === 'SELL' ? Side.SELL : Side.BUY;
 
     const response = await client.createAndPostOrder(
-      { tokenID: String(tokenId), price: Number(price), size: Number(size), side: sideVal },
+      { tokenID: tokenIdStr, price: Number(price), size: Number(size), side: sideVal },
       { tickSize, negRisk },
       OrderType.GTC
     );
     res.json(response);
   } catch (err) {
     console.error('Polymarket order error:', err);
-    res.status(500).json({ error: err.message || 'Order failed' });
+    const msg = err?.message || 'Order failed';
+    res.status(500).json({ error: msg });
   }
 });
 

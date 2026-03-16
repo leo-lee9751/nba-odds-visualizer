@@ -31,6 +31,37 @@ async function fetchUpcoming() {
   return data.games || [];
 }
 
+async function fetchLiveGames() {
+  try {
+    const res = await fetchWithTimeout(`${API_BASE}/api/nba/live`);
+    if (!res.ok) return;
+    const data = await res.json();
+    liveGames = data.games || [];
+    renderLiveGames();
+  } catch {
+    liveGames = [];
+    renderLiveGames();
+  }
+}
+
+function renderLiveGames() {
+  const content = document.getElementById('liveContent');
+  if (!content) return;
+  if (liveGames.length === 0) {
+    content.innerHTML = '<p class="live-empty">No games in progress right now.</p>';
+    return;
+  }
+  content.innerHTML = `
+    <div class="live-list">
+      ${liveGames.map((g) => `
+        <a href="${escapeHtml(g.url || '#')}" target="_blank" rel="noopener" class="live-card">
+          <span class="live-matchup">${escapeHtml(g.awayTeam)} ${g.awayScore ?? 0} – ${g.homeScore ?? 0} ${escapeHtml(g.homeTeam)}</span>
+          <span class="live-status">${escapeHtml(g.gameStatusText || 'Live')}</span>
+        </a>
+      `).join('')}
+    </div>`;
+}
+
 function gameKey(away, home) {
   return `${String(away).toUpperCase()}-${String(home).toUpperCase()}`;
 }
@@ -55,6 +86,7 @@ function escapeHtml(s) {
 }
 
 let currentRows = [];
+let liveGames = [];
 let authState = { polymarket: false, kalshi: false };
 let balances = { polymarket: null, kalshi: null };
 let myOrders = { polymarket: { orders: [], error: null }, kalshi: { orders: [], error: null } };
@@ -220,6 +252,7 @@ async function load(options = {}) {
     });
     refreshBalances();
     if (authState.polymarket || authState.kalshi) fetchMyOrders();
+    fetchLiveGames();
   } catch (err) {
     wrapper.innerHTML = `<div class="error">${escapeHtml(err?.message || 'Failed to load')}${getConnectionErrorHint()}</div>`;
   } finally {
@@ -283,6 +316,321 @@ async function fetchMyOrders() {
     myOrders = { polymarket: { orders: [], error: null }, kalshi: { orders: [], error: null } };
   }
   renderDashboard();
+}
+
+let arbOpportunities = [];
+let arbConfig = {};
+const ARB_POLL_INTERVAL_MS = 500; // poll every 0.5s; faster = more chance to catch arbs before they disappear
+const SIM_INITIAL_POLY = 1000;
+const SIM_INITIAL_KAL = 1000;
+const SIM_COOLDOWN_MS = 3000; // same game+strategy can be taken again after 3s (arbs often flash repeatedly)
+let simRunning = false;
+let simPoly = SIM_INITIAL_POLY;
+let simKal = SIM_INITIAL_KAL;
+let simHistory = []; // { t, poly, kal, total }
+let simTaken = new Map(); // key (gameKey-strategy) -> lastTakenTime
+let simChart = null;
+let simHistoryIntervalId = null;
+const ARB_STALE_KEEP_MS = 8000; // keep disappeared opportunities visible for 8s so user can click "Place arb"
+const ARB_PAST_MAX = 50; // max past opportunities to keep
+const arbStaleMap = new Map(); // key = gameKey+strategy, value = { ...opp, staleUntil }
+let arbPastOpportunities = []; // { ...opp, lastSeenAt } newest first, capped at ARB_PAST_MAX
+let arbPollTimerId = null;
+let arbFetchInFlight = false;
+let arbPendingManualCheck = false;
+let arbShowCheckingIndicator = false;
+let arbUserHasClickedCheck = false; // only show indicator after user has clicked "Check arb" at least once
+
+async function fetchArbOpportunities(silent = false) {
+  if (arbFetchInFlight) {
+    if (!silent) arbPendingManualCheck = true;
+    return;
+  }
+  const btn = document.getElementById('checkArbBtn');
+  const content = document.getElementById('arbContent');
+  arbShowCheckingIndicator = !silent;
+  if (!silent) {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Checking…';
+    }
+    content.hidden = false;
+    content.innerHTML = '<div class="loading">Loading…</div>';
+  }
+  arbFetchInFlight = true;
+  updateArbCheckingIndicator();
+  try {
+    const res = await fetchWithTimeout(`${API_BASE}/api/arb/opportunities`);
+    const data = await res.json().catch(() => ({}));
+    const newList = data.opportunities || [];
+    const newKeys = new Set(newList.map((o) => `${o.gameKey}-${o.strategy}`));
+    const prev = arbOpportunities;
+    arbOpportunities = newList;
+    for (const o of prev) {
+      const key = `${o.gameKey}-${o.strategy}`;
+      if (!newKeys.has(key)) arbStaleMap.set(key, { ...o, staleUntil: Date.now() + ARB_STALE_KEEP_MS });
+    }
+    for (const key of arbStaleMap.keys()) {
+      if (arbStaleMap.get(key).staleUntil < Date.now()) arbStaleMap.delete(key);
+    }
+    arbConfig = data.config || {};
+    if (simRunning) processSimulationArbs(newList);
+    renderArbOpportunities();
+    content.hidden = false;
+  } catch (err) {
+    if (!silent) {
+      content.innerHTML = `<div class="error">${escapeHtml(err?.message || 'Failed to load arb opportunities')}</div>`;
+    }
+    content.hidden = false;
+  } finally {
+    arbFetchInFlight = false;
+    updateArbCheckingIndicator();
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Check arb';
+    }
+    if (arbPendingManualCheck) {
+      arbPendingManualCheck = false;
+      setTimeout(() => fetchArbOpportunities(false), 0);
+    }
+  }
+}
+
+function updateArbCheckingIndicator() {
+  const el = document.getElementById('arbCheckingIndicator');
+  const show = arbFetchInFlight && arbShowCheckingIndicator && arbUserHasClickedCheck;
+  if (el) el.hidden = !show;
+}
+
+function startArbAutoRefresh() {
+  if (arbPollTimerId != null) return;
+  const indicatorEl = document.getElementById('arbCheckingIndicator');
+  if (indicatorEl) indicatorEl.hidden = true;
+  fetchArbOpportunities(true);
+  arbPollTimerId = setInterval(() => fetchArbOpportunities(true), ARB_POLL_INTERVAL_MS);
+}
+
+function processSimulationArbs(opportunities) {
+  const now = Date.now();
+  for (const opp of opportunities) {
+    const key = `${opp.gameKey}-${opp.strategy}`;
+    const last = simTaken.get(key);
+    if (last != null && now - last < SIM_COOLDOWN_MS) continue;
+    const x = Number(opp.stakePolyUsd) || 0;
+    const y = Number(opp.stakeKalshiUsd) || 0;
+    const fee = Number(opp.feeUsd) || 0;
+    const payout = x / (Number(opp.polyPrice) || 0.5);
+    if (simPoly < x || simKal < y) continue;
+    simPoly -= x;
+    simKal -= y;
+    simPoly += payout - fee;
+    simTaken.set(key, now);
+    simHistory.push({ t: now, poly: simPoly, kal: simKal, total: simPoly + simKal });
+    updateSimChart();
+  }
+  renderSimBalances();
+}
+
+function renderSimBalances() {
+  const el = document.getElementById('simBalances');
+  if (!el) return;
+  el.textContent = `Poly $${simPoly.toFixed(2)}  ·  Kalshi $${simKal.toFixed(2)}  ·  Total $${(simPoly + simKal).toFixed(2)}`;
+}
+
+function updateSimChart() {
+  if (!simChart || !simHistory.length) return;
+  const labels = simHistory.map((p) => {
+    const d = new Date(p.t);
+    return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  });
+  simChart.data.labels = labels;
+  simChart.data.datasets[0].data = simHistory.map((p) => p.poly);
+  simChart.data.datasets[1].data = simHistory.map((p) => p.kal);
+  simChart.data.datasets[2].data = simHistory.map((p) => p.poly + p.kal);
+  simChart.update('none');
+}
+
+function initSimChart() {
+  const canvas = document.getElementById('simChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  if (simChart) simChart.destroy();
+  simChart = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Polymarket', data: [], borderColor: '#6366f1', backgroundColor: 'rgba(99, 102, 241, 0.1)', fill: true, tension: 0.1 },
+        { label: 'Kalshi', data: [], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', fill: true, tension: 0.1 },
+        { label: 'Total', data: [], borderColor: '#22c55e', backgroundColor: 'rgba(34, 197, 94, 0.1)', fill: true, tension: 0.1 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { maxTicksLimit: 12, color: '#8b92a8' }, grid: { color: '#2a3140' } },
+        y: { beginAtZero: false, ticks: { color: '#8b92a8' }, grid: { color: '#2a3140' } },
+      },
+      plugins: { legend: { labels: { color: '#e6e9f0' } } },
+    },
+  });
+}
+
+function startSimulation() {
+  simRunning = true;
+  simPoly = SIM_INITIAL_POLY;
+  simKal = SIM_INITIAL_KAL;
+  simHistory = [{ t: Date.now(), poly: simPoly, kal: simKal, total: simPoly + simKal }];
+  simTaken = new Map();
+  initSimChart();
+  updateSimChart();
+  renderSimBalances();
+  document.getElementById('simStartBtn').disabled = true;
+  document.getElementById('simStopBtn').disabled = false;
+  simHistoryIntervalId = setInterval(() => {
+    if (!simRunning) return;
+    simHistory.push({ t: Date.now(), poly: simPoly, kal: simKal, total: simPoly + simKal });
+    if (simHistory.length > 500) simHistory = simHistory.slice(-400);
+    updateSimChart();
+  }, 2000);
+}
+
+function stopSimulation() {
+  simRunning = false;
+  if (simHistoryIntervalId) {
+    clearInterval(simHistoryIntervalId);
+    simHistoryIntervalId = null;
+  }
+  document.getElementById('simStartBtn').disabled = false;
+  document.getElementById('simStopBtn').disabled = true;
+}
+
+function formatLastSeen(ms) {
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return sec <= 1 ? 'just now' : sec + ' s ago';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + ' min ago';
+  const hr = Math.floor(min / 60);
+  return hr + ' hr ago';
+}
+
+function renderArbOpportunities() {
+  const content = document.getElementById('arbContent');
+  const pastSection = document.getElementById('arbPastSection');
+  const pastContent = document.getElementById('arbPastContent');
+  if (!content) return;
+
+  const now = Date.now();
+  for (const key of Array.from(arbStaleMap.keys())) {
+    const o = arbStaleMap.get(key);
+    if (o.staleUntil < now) {
+      const { staleUntil, ...opp } = o;
+      arbPastOpportunities.unshift({ ...opp, lastSeenAt: now - ARB_STALE_KEEP_MS });
+      if (arbPastOpportunities.length > ARB_PAST_MAX) arbPastOpportunities.pop();
+      arbStaleMap.delete(key);
+    }
+  }
+
+  const staleList = Array.from(arbStaleMap.values());
+  const displayList = [...arbOpportunities, ...staleList];
+  if (displayList.length === 0) {
+    content.innerHTML = '<p class="arb-empty">No arb opportunities above the minimum profit threshold.</p>';
+  } else {
+    content.innerHTML = `
+      <div class="arb-list">
+        ${displayList.map((opp, i) => {
+          const isStale = i >= arbOpportunities.length;
+          const canPlace = !isStale && authState.polymarket && authState.kalshi;
+          return `
+          <div class="arb-card ${isStale ? 'arb-card-stale' : ''}" data-index="${i}" data-stale="${isStale}">
+            ${isStale ? '<div class="arb-stale-badge">Arb no longer valid — do not place</div><div class="arb-stale-warning">This opportunity no longer exists. Placing this bet could lose money.</div>' : ''}
+            <div class="arb-game">${escapeHtml(opp.awayTeam)} @ ${escapeHtml(opp.homeTeam)}</div>
+            <div class="arb-strategy">${escapeHtml(opp.strategyLabel || '')}</div>
+            <div class="arb-details">
+              Stake Poly $${opp.stakePolyUsd} · Kalshi $${opp.stakeKalshiUsd} · Net profit $${opp.netProfitUsd}${opp.feeUsd != null ? ` (fee $${opp.feeUsd})` : ''}
+            </div>
+            <button type="button" class="auth-btn arb-place-btn" data-index="${i}" data-stale="${isStale}" ${!canPlace ? 'disabled' : ''} title="${isStale ? 'Arb no longer valid — do not place. You could lose money.' : (!authState.polymarket || !authState.kalshi) ? 'Sign in to both Polymarket and Kalshi' : 'Place arb'}">${isStale ? 'No longer valid' : 'Place arb'}</button>
+          </div>`;
+        }).join('')}
+      </div>`;
+    content.querySelectorAll('.arb-place-btn').forEach((btn) => {
+      if (btn.dataset.stale === 'true') return;
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.index, 10);
+        const opp = displayList[idx];
+        if (opp && !opp.staleUntil) placeArb(opp, btn);
+      });
+    });
+  }
+  content.hidden = false;
+
+  if (pastSection && pastContent) {
+    if (arbPastOpportunities.length === 0) {
+      pastSection.hidden = true;
+    } else {
+      pastSection.hidden = false;
+      pastContent.innerHTML = `
+        <div class="arb-list arb-past-list">
+          ${arbPastOpportunities.map((opp) => {
+            const lastSeen = formatLastSeen(now - opp.lastSeenAt);
+            return `
+            <div class="arb-card arb-card-past">
+              <div class="arb-past-meta">Last seen ${escapeHtml(lastSeen)}</div>
+              <div class="arb-game">${escapeHtml(opp.awayTeam)} @ ${escapeHtml(opp.homeTeam)}</div>
+              <div class="arb-strategy">${escapeHtml(opp.strategyLabel || '')}</div>
+              <div class="arb-details">
+                Stake Poly $${opp.stakePolyUsd} · Kalshi $${opp.stakeKalshiUsd} · Net profit $${opp.netProfitUsd}${opp.feeUsd != null ? ` (fee $${opp.feeUsd})` : ''}
+              </div>
+            </div>`;
+          }).join('')}
+        </div>`;
+    }
+  }
+}
+
+async function placeArb(opp, btnEl) {
+  if (!authState.polymarket || !authState.kalshi) {
+    alert('Sign in to both Polymarket and Kalshi to place an arb.');
+    return;
+  }
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = 'Placing…';
+  }
+  try {
+    const res = await fetch(`${API_BASE}/api/arb/execute`, {
+      method: 'POST',
+      ...fetchOpts,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opp),
+    });
+    let data = {};
+    try {
+      data = await res.json();
+    } catch (_) {
+      data = { error: res.statusText || 'Request failed' };
+    }
+    if (!res.ok) {
+      const msg = typeof data.error === 'string' ? data.error : (data.error && (data.error.message || String(data.error))) || 'Arb execute failed';
+      if (data.leg1Done) {
+        alert(`Warning: Poly leg filled but Kalshi failed. ${msg}`);
+      } else {
+        alert(msg);
+      }
+      return;
+    }
+    alert('Arb placed. Poly and Kalshi orders submitted.');
+    await fetchAuthStatus();
+    fetchMyOrders();
+    fetchArbOpportunities();
+  } catch (err) {
+    alert(err?.message || 'Arb execute failed');
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = 'Place arb';
+    }
+  }
 }
 
 function kalshiTickerToMatchup(ticker) {
@@ -370,7 +718,11 @@ function formatBalance(platform) {
     const msg = String(b.error).slice(0, 80);
     return msg.length < String(b.error).length ? ` (error: ${msg}…)` : ` (error: ${msg})`;
   }
-  if (platform === 'polymarket' && b.balanceUsdc != null) return ` $${Number(b.balanceUsdc).toFixed(2)}`;
+  if (platform === 'polymarket' && b.balanceUsdc != null) {
+    const s = ` $${Number(b.balanceUsdc).toFixed(2)}`;
+    if (b.balanceUsdc === 0 && b.hint) return s + ' — ' + b.hint;
+    return s;
+  }
   if (platform === 'kalshi' && b.balanceCents != null) return ` $${(Number(b.balanceCents) / 100).toFixed(2)}`;
   return '';
 }
@@ -597,5 +949,21 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
   document.getElementById('kalshiSignInModal').hidden = true;
   document.getElementById('betModal').hidden = true;
   await fetchAuthStatus();
+  fetchLiveGames();
   load();
+  const checkArbBtn = document.getElementById('checkArbBtn');
+  if (checkArbBtn) {
+    checkArbBtn.addEventListener('click', () => {
+      arbUserHasClickedCheck = true;
+      fetchArbOpportunities(false);
+    });
+  }
+  startArbAutoRefresh();
+
+  const simStartBtn = document.getElementById('simStartBtn');
+  const simStopBtn = document.getElementById('simStopBtn');
+  if (simStartBtn) simStartBtn.addEventListener('click', startSimulation);
+  if (simStopBtn) simStopBtn.addEventListener('click', stopSimulation);
+  const simBalancesEl = document.getElementById('simBalances');
+  if (simBalancesEl && !simRunning) simBalancesEl.textContent = `Poly $${SIM_INITIAL_POLY}  ·  Kalshi $${SIM_INITIAL_KAL}  ·  Total $${SIM_INITIAL_POLY + SIM_INITIAL_KAL} (initial)`;
 })();
