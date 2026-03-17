@@ -138,6 +138,24 @@ body {
   min-height: 80px;
 }
 
+.auth-form label.remember-me {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.auth-form label.remember-me input {
+  width: auto;
+  margin-top: 0;
+}
+
+.auth-form .form-hint {
+  font-size: 0.8rem;
+  color: var(--text-muted, #888);
+  margin-left: 0.25rem;
+}
+
 .modal-actions {
   display: flex;
   gap: 0.5rem;

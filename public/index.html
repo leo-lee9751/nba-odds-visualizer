@@ -17,6 +17,9 @@
       <button type="button" class="auth-btn" id="signInPolyBtn" title="Sign in to place bets on Polymarket">Sign in Polymarket</button>
       <button type="button" class="auth-btn" id="signInKalshiBtn" title="Sign in to place bets on Kalshi">Sign in Kalshi</button>
       <span class="auth-status" id="authStatus"></span>
+      <button type="button" class="auth-btn auth-btn-outline" id="enablePolyUsdcBtn" style="display:none;" title="Opens MetaMask to approve USDC spending for this app (CLOB exchange). You’ll get the “Approve spending cap” prompt.">Enable USDC</button>
+      <a href="#" class="auth-btn auth-btn-outline" id="enablePolyUsdcManual" style="display:none;" title="Polygonscan: click 'Write as Proxy' (not Write Contract), then approve() — spender: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E, amount: 115792089237316195423570985008687907853269984665640564039457584007913129639935">Approve USDC (manual)</a>
+      <a href="#" class="auth-btn auth-btn-outline" id="enablePolyUsdcCtfManual" style="display:none;" title="Polygonscan: Connect Web3, find setApprovalForAll, operator: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E, approved: true">Approve CTF (manual)</a>
       <button type="button" class="auth-btn auth-btn-outline" id="logoutBtn" style="display:none;">Log out</button>
     </div>
     <button class="refresh-btn" id="refreshBtn" title="Refresh odds" type="button">
@@ -40,6 +43,7 @@
         <label>Secret <input type="password" name="secret" placeholder="Base64 secret" required /></label>
         <label>Passphrase <input type="password" name="passphrase" required /></label>
         <label>Private key (for signing orders) <input type="password" name="privateKey" placeholder="0x..." required /></label>
+        <label class="remember-me"><input type="checkbox" name="remember" /> Remember me on this device</label>
         <div class="modal-actions">
           <button type="button" class="auth-btn auth-btn-outline" id="closePolySignIn">Cancel</button>
           <button type="submit" class="auth-btn">Sign in</button>
@@ -54,11 +58,25 @@
       <form id="kalshiSignInForm" class="auth-form">
         <label>API Key ID <input type="text" name="apiKeyId" placeholder="UUID" required /></label>
         <label>Private key (PEM) <textarea name="privateKey" rows="4" placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;...&#10;-----END RSA PRIVATE KEY-----" required></textarea></label>
+        <label class="remember-me"><input type="checkbox" name="remember" /> Remember me on this device</label>
         <div class="modal-actions">
           <button type="button" class="auth-btn auth-btn-outline" id="closeKalshiSignIn">Cancel</button>
           <button type="submit" class="auth-btn">Sign in</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Enable USDC / CTF approvals (each button = fresh click so MetaMask opens) -->
+  <div class="modal-overlay" id="polyApproveModal" hidden>
+    <div class="modal">
+      <h3>Approve trading (2 steps)</h3>
+      <p class="modal-hint">Each button opens MetaMask. Complete both. Use the same wallet you signed in with.</p>
+      <div class="modal-actions" style="flex-direction:column;gap:0.5rem;">
+        <button type="button" class="auth-btn" id="polyApproveUsdcBtn">1. Approve USDC</button>
+        <button type="button" class="auth-btn" id="polyApproveCtfBtn">2. Approve CTF</button>
+        <button type="button" class="auth-btn auth-btn-outline" id="closePolyApproveModal">Done / Cancel</button>
+      </div>
     </div>
   </div>
 

@@ -212,8 +212,8 @@ async function load(options = {}) {
     rows.sort((a, b) => {
       const aDone = isCompleted(a);
       const bDone = isCompleted(b);
-      if (aDone && !bDone) return -1;
-      if (!aDone && bDone) return 1;
+      if (aDone && !bDone) return 1;
+      if (!aDone && bDone) return -1;
       return new Date(a.sortDate || 0) - new Date(b.sortDate || 0);
     });
 
@@ -720,7 +720,8 @@ function formatBalance(platform) {
   }
   if (platform === 'polymarket' && b.balanceUsdc != null) {
     const s = ` $${Number(b.balanceUsdc).toFixed(2)}`;
-    if (b.balanceUsdc === 0 && b.hint) return s + ' — ' + b.hint;
+    if (b.hint) return s + ' — ' + b.hint;
+    if (b.allowanceUsdc != null && b.allowanceUsdc < b.balanceUsdc) return s + ` (allowance $${Number(b.allowanceUsdc).toFixed(2)})`;
     return s;
   }
   if (platform === 'kalshi' && b.balanceCents != null) return ` $${(Number(b.balanceCents) / 100).toFixed(2)}`;
@@ -732,6 +733,7 @@ function updateAuthUI() {
   const logoutBtn = document.getElementById('logoutBtn');
   const polyBtn = document.getElementById('signInPolyBtn');
   const kalshiBtn = document.getElementById('signInKalshiBtn');
+  const enablePolyUsdcBtn = document.getElementById('enablePolyUsdcBtn');
   const parts = [];
   if (authState.polymarket) parts.push('Polymarket' + formatBalance('polymarket'));
   if (authState.kalshi) parts.push('Kalshi' + formatBalance('kalshi'));
@@ -739,6 +741,13 @@ function updateAuthUI() {
   logoutBtn.style.display = parts.length ? 'inline-block' : 'none';
   polyBtn.style.display = authState.polymarket ? 'none' : 'inline-block';
   kalshiBtn.style.display = authState.kalshi ? 'none' : 'inline-block';
+  const poly = balances.polymarket;
+  const needAllowance = authState.polymarket && poly && poly.balanceUsdc > 0 && (poly.allowanceUsdc == null || poly.allowanceUsdc < poly.balanceUsdc);
+  if (enablePolyUsdcBtn) enablePolyUsdcBtn.style.display = needAllowance ? 'inline-block' : 'none';
+  const enablePolyUsdcManual = document.getElementById('enablePolyUsdcManual');
+  if (enablePolyUsdcManual) enablePolyUsdcManual.style.display = needAllowance ? 'inline-block' : 'none';
+  const enablePolyUsdcCtfManual = document.getElementById('enablePolyUsdcCtfManual');
+  if (enablePolyUsdcCtfManual) enablePolyUsdcCtfManual.style.display = needAllowance ? 'inline-block' : 'none';
 }
 
 function openBetModal(platform, key) {
@@ -765,7 +774,7 @@ function openBetModal(platform, key) {
         </select>
       </label>
       <label>Price (0–1) <input type="number" name="price" step="0.01" min="0.01" max="0.99" value="${defaultPriceAway}" required /></label>
-      <label>Size (shares / $) <input type="number" name="size" min="1" step="1" value="10" required /></label>
+      <label>Size (shares) <input type="number" name="size" min="1" step="1" value="10" required /> <span class="form-hint">Min $1 total (size × price)</span></label>
     `;
     fieldsEl.querySelector('select[name="outcome"]').addEventListener('change', (e) => {
       const opt = e.target.selectedOptions[0];
@@ -807,25 +816,31 @@ document.getElementById('signInPolyBtn').addEventListener('click', () => {
 document.getElementById('closePolySignIn').addEventListener('click', () => {
   document.getElementById('polySignInModal').hidden = true;
 });
+const POLY_REMEMBER_KEY = 'nbaOdds_polyRemember';
+const KALSHI_REMEMBER_KEY = 'nbaOdds_kalshiRemember';
+
 document.getElementById('polySignInForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
+  const payload = {
+    apiKey: fd.get('apiKey'),
+    secret: fd.get('secret'),
+    passphrase: fd.get('passphrase'),
+    privateKey: fd.get('privateKey'),
+  };
   const res = await fetch(`${API_BASE}/api/auth/polymarket`, {
     method: 'POST',
     ...fetchOpts,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      apiKey: fd.get('apiKey'),
-      secret: fd.get('secret'),
-      passphrase: fd.get('passphrase'),
-      privateKey: fd.get('privateKey'),
-    }),
+    body: JSON.stringify(payload),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     alert(data.error || 'Sign-in failed');
     return;
   }
+  if (fd.get('remember')) try { localStorage.setItem(POLY_REMEMBER_KEY, JSON.stringify(payload)); } catch (_) {}
+  else try { localStorage.removeItem(POLY_REMEMBER_KEY); } catch (_) {}
   document.getElementById('polySignInModal').hidden = true;
   e.target.reset();
   await fetchAuthStatus();
@@ -841,17 +856,20 @@ document.getElementById('closeKalshiSignIn').addEventListener('click', () => {
 document.getElementById('kalshiSignInForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
+  const payload = { apiKeyId: fd.get('apiKeyId'), privateKey: fd.get('privateKey') };
   const res = await fetch(`${API_BASE}/api/auth/kalshi`, {
     method: 'POST',
     ...fetchOpts,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apiKeyId: fd.get('apiKeyId'), privateKey: fd.get('privateKey') }),
+    body: JSON.stringify(payload),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     alert(data.error || 'Sign-in failed');
     return;
   }
+  if (fd.get('remember')) try { localStorage.setItem(KALSHI_REMEMBER_KEY, JSON.stringify(payload)); } catch (_) {}
+  else try { localStorage.removeItem(KALSHI_REMEMBER_KEY); } catch (_) {}
   document.getElementById('kalshiSignInModal').hidden = true;
   e.target.reset();
   await fetchAuthStatus();
@@ -860,9 +878,118 @@ document.getElementById('kalshiSignInForm').addEventListener('submit', async (e)
 
 document.getElementById('logoutBtn').addEventListener('click', async () => {
   await fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', ...fetchOpts });
+  try { localStorage.removeItem(POLY_REMEMBER_KEY); localStorage.removeItem(KALSHI_REMEMBER_KEY); } catch (_) {}
   await fetchAuthStatus();
   load({ animate: false });
 });
+
+// Polygon: USDC.e, CTF (Conditional Tokens), and CLOB exchange. Both approvals required for orders.
+const POLYGON_USDC = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const POLYGON_CTF = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+const POLYGON_CLOB_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+const POLYGON_CHAIN_ID = '0x89';
+const POLYGONSCAN_USDC_WRITE = 'https://polygonscan.com/address/' + POLYGON_USDC + '#writeContract';
+const POLYGONSCAN_CTF_WRITE = 'https://polygonscan.com/address/' + POLYGON_CTF + '#writeContract';
+
+function pad32(v, len) {
+  return String(v).replace(/^0x/, '').padStart(len || 64, '0');
+}
+function encodeApprove(spender, amountHex) {
+  return '0x095ea7b3' + pad32(spender) + pad32(amountHex || 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
+}
+function encodeSetApprovalForAll(operator, approved) {
+  return '0xa22cb465' + pad32(operator) + pad32(approved ? '1' : '0');
+}
+
+function openPolyApproveModal() {
+  document.getElementById('polyApproveModal').hidden = false;
+}
+function closePolyApproveModal() {
+  document.getElementById('polyApproveModal').hidden = true;
+}
+
+async function onEnablePolyUsdcClick(btn) {
+  if (!btn || btn.disabled) return;
+  if (typeof window.ethereum === 'undefined') {
+    alert('MetaMask not found. Use the manual links below to approve on Polygonscan (connect wallet, Polygon network).');
+    window.open(POLYGONSCAN_USDC_WRITE, '_blank');
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    await window.ethereum.request({ method: 'eth_requestAccounts' });
+    const chainId = await window.ethereum.request({ method: 'eth_chainId' });
+    if (chainId !== POLYGON_CHAIN_ID) {
+      try {
+        await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: POLYGON_CHAIN_ID }] });
+      } catch (e) {
+        if (e?.code === 4902) alert('Add Polygon network in MetaMask first, then try again.');
+        else alert(e?.message || 'Switch to Polygon in MetaMask and try again.');
+        return;
+      }
+    }
+    openPolyApproveModal();
+  } catch (e) {
+    alert(e?.code === 4001 ? 'Connect with MetaMask first.' : (e?.message || 'Request failed'));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Enable USDC';
+  }
+}
+
+document.body.addEventListener('click', (e) => {
+  const btn = e.target.id === 'enablePolyUsdcBtn' ? e.target : e.target.closest('#enablePolyUsdcBtn');
+  if (!btn) return;
+  e.preventDefault();
+  onEnablePolyUsdcClick(btn);
+});
+
+document.getElementById('closePolyApproveModal').addEventListener('click', () => {
+  closePolyApproveModal();
+  refreshBalances();
+});
+document.getElementById('polyApproveModal').addEventListener('click', (ev) => {
+  if (ev.target.id === 'polyApproveModal') { closePolyApproveModal(); refreshBalances(); }
+});
+document.getElementById('polyApproveUsdcBtn').addEventListener('click', async function () {
+  if (typeof window.ethereum === 'undefined') return;
+  const b = this;
+  b.disabled = true;
+  b.textContent = 'Opening MetaMask…';
+  try {
+    await window.ethereum.request({
+      method: 'eth_sendTransaction',
+      params: [{ to: POLYGON_USDC, data: encodeApprove(POLYGON_CLOB_EXCHANGE), value: '0x0' }],
+    });
+    b.textContent = '1. Approve USDC ✓';
+  } catch (e) {
+    if (e?.code === 4001) b.textContent = '1. Approve USDC (rejected)';
+    else { alert(e?.message || 'Failed'); b.textContent = '1. Approve USDC'; }
+  }
+  b.disabled = false;
+});
+document.getElementById('polyApproveCtfBtn').addEventListener('click', async function () {
+  if (typeof window.ethereum === 'undefined') return;
+  const b = this;
+  b.disabled = true;
+  b.textContent = 'Opening MetaMask…';
+  try {
+    await window.ethereum.request({
+      method: 'eth_sendTransaction',
+      params: [{ to: POLYGON_CTF, data: encodeSetApprovalForAll(POLYGON_CLOB_EXCHANGE, true), value: '0x0' }],
+    });
+    b.textContent = '2. Approve CTF ✓';
+  } catch (e) {
+    if (e?.code === 4001) b.textContent = '2. Approve CTF (rejected)';
+    else { alert(e?.message || 'Failed'); b.textContent = '2. Approve CTF'; }
+  }
+  b.disabled = false;
+});
+const manualUsdcEl = document.getElementById('enablePolyUsdcManual');
+if (manualUsdcEl) manualUsdcEl.addEventListener('click', (e) => { e.preventDefault(); window.open(POLYGONSCAN_USDC_WRITE, '_blank'); });
+const manualCtfEl = document.getElementById('enablePolyUsdcCtfManual');
+if (manualCtfEl) manualCtfEl.addEventListener('click', (e) => { e.preventDefault(); window.open(POLYGONSCAN_CTF_WRITE, '_blank'); });
 
 document.getElementById('closeBetModal').addEventListener('click', closeBetModal);
 document.getElementById('betModal').addEventListener('click', (e) => {
@@ -881,13 +1008,20 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
   const fd = new FormData(form);
 
   if (platform === 'polymarket') {
+    const price = Number(fd.get('price'));
+    const size = Number(fd.get('size'));
+    const notional = price * size;
+    if (notional < 1) {
+      alert(`Polymarket minimum order is $1. Your size × price = $${notional.toFixed(2)}. Increase size or price.`);
+      return;
+    }
     const outcome = fd.get('outcome');
     const tokenId = outcome === 'away' ? game.tokenIdAway : game.tokenIdHome;
     const body = {
       tokenId,
       side: 'BUY',
-      price: Number(fd.get('price')),
-      size: Number(fd.get('size')),
+      price,
+      size,
       tickSize: game.tickSize || '0.01',
       negRisk: game.negRisk || false,
     };
@@ -900,7 +1034,16 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       const msg = typeof data.error === 'object' ? (data.error?.message || JSON.stringify(data.error)) : (data.error || 'Order failed');
-      alert(msg);
+      const fix = data.fix || '';
+      const ba = data.balanceAllowance;
+      const wallet = data.walletAddress;
+      const detail = data.detail?.error || data.detail?.message;
+      const parts = [msg];
+      if (wallet) parts.push(`Wallet: ${wallet}`);
+      if (ba) parts.push(`Balance: $${Number(ba.balanceUsdc).toFixed(2)} USDC · Allowance: $${Number(ba.allowanceUsdc).toFixed(2)}`);
+      if (detail) parts.push(detail);
+      if (fix) parts.push(fix);
+      alert(parts.join('\n\n'));
       return;
     }
     alert(`Order placed: ${data.status || 'live'}`);
@@ -949,6 +1092,24 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
   document.getElementById('kalshiSignInModal').hidden = true;
   document.getElementById('betModal').hidden = true;
   await fetchAuthStatus();
+  try {
+    if (!authState.polymarket) {
+      const raw = localStorage.getItem(POLY_REMEMBER_KEY);
+      if (raw) {
+        const payload = JSON.parse(raw);
+        const res = await fetch(`${API_BASE}/api/auth/polymarket`, { method: 'POST', ...fetchOpts, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (res.ok) await fetchAuthStatus();
+      }
+    }
+    if (!authState.kalshi) {
+      const raw = localStorage.getItem(KALSHI_REMEMBER_KEY);
+      if (raw) {
+        const payload = JSON.parse(raw);
+        const res = await fetch(`${API_BASE}/api/auth/kalshi`, { method: 'POST', ...fetchOpts, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (res.ok) await fetchAuthStatus();
+      }
+    }
+  } catch (_) {}
   fetchLiveGames();
   load();
   const checkArbBtn = document.getElementById('checkArbBtn');

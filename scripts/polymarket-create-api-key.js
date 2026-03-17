@@ -35,7 +35,9 @@ try {
     console.error('Try: CREATE_NEW=1 POLY_PRIVATE_KEY=0x... node scripts/polymarket-create-api-key.js');
     process.exit(1);
   }
-  console.log('\nUse these in the NBA Odds Visualizer "Sign in Polymarket" form:\n');
+  console.log('\nWallet address for this API key:', wallet.address);
+  console.log('(This must be the account that has USDC on Polygon — not 0x5dB1...)\n');
+  console.log('Use these in the NBA Odds Visualizer "Sign in Polymarket" form:\n');
   console.log('API Key:    ', apiKey);
   console.log('Secret:     ', creds.secret);
   console.log('Passphrase: ', creds.passphrase);
