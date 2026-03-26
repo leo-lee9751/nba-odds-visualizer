@@ -1,5 +1,5 @@
 const API_BASE = '';
-const FETCH_TIMEOUT_MS = 20000;
+const FETCH_TIMEOUT_MS = 60000;
 
 const fetchOpts = { credentials: 'include' };
 
@@ -335,6 +335,7 @@ const ARB_STALE_KEEP_MS = 8000; // keep disappeared opportunities visible for 8s
 const ARB_PAST_MAX = 50; // max past opportunities to keep
 const arbStaleMap = new Map(); // key = gameKey+strategy, value = { ...opp, staleUntil }
 let arbPastOpportunities = []; // { ...opp, lastSeenAt } newest first, capped at ARB_PAST_MAX
+const closedOrderbooks = new Set(); // token IDs with no CLOB orderbook — skip these in arb display
 let arbPollTimerId = null;
 let arbFetchInFlight = false;
 let arbPendingManualCheck = false;
@@ -362,7 +363,11 @@ async function fetchArbOpportunities(silent = false) {
   try {
     const res = await fetchWithTimeout(`${API_BASE}/api/arb/opportunities`);
     const data = await res.json().catch(() => ({}));
-    const newList = data.opportunities || [];
+    const newList = (data.opportunities || []).filter((o) =>
+      !closedOrderbooks.has(o.polyTokenId) &&
+      !closedOrderbooks.has(o.polyTokenIdAway) &&
+      !closedOrderbooks.has(o.polyTokenIdHome)
+    );
     const newKeys = new Set(newList.map((o) => `${o.gameKey}-${o.strategy}`));
     const prev = arbOpportunities;
     arbOpportunities = newList;
@@ -612,6 +617,13 @@ async function placeArb(opp, btnEl) {
     }
     if (!res.ok) {
       const msg = typeof data.error === 'string' ? data.error : (data.error && (data.error.message || String(data.error))) || 'Arb execute failed';
+      if (/orderbook.*no longer exists|does not exist/i.test(msg)) {
+        if (opp.polyTokenId) closedOrderbooks.add(opp.polyTokenId);
+        if (opp.polyTokenIdAway) closedOrderbooks.add(opp.polyTokenIdAway);
+        if (opp.polyTokenIdHome) closedOrderbooks.add(opp.polyTokenIdHome);
+        fetchArbOpportunities();
+        return;
+      }
       if (data.leg1Done) {
         alert(`Warning: Poly leg filled but Kalshi failed. ${msg}`);
       } else {
@@ -827,6 +839,7 @@ document.getElementById('polySignInForm').addEventListener('submit', async (e) =
     secret: fd.get('secret'),
     passphrase: fd.get('passphrase'),
     privateKey: fd.get('privateKey'),
+    funderAddress: (fd.get('funderAddress') || '').trim() || undefined,
   };
   const res = await fetch(`${API_BASE}/api/auth/polymarket`, {
     method: 'POST',

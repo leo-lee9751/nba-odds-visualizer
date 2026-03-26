@@ -226,8 +226,43 @@ function normalizePolyTokenId(val) {
   return s.replace(/\D/g, '') || s;
 }
 
+// Fetch market from CLOB by condition_id (like Kushak1 polymarket-auto-trade-example). Returns null if market closed or no orderbook.
+async function fetchClobMarket(conditionId) {
+  if (!conditionId || typeof conditionId !== 'string') return null;
+  const id = String(conditionId).trim();
+  if (!id) return null;
+  try {
+    const res = await fetch(`https://clob.polymarket.com/markets/${encodeURIComponent(id)}`, fetchOptions);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.closed || !data?.accepting_orders) return null;
+    return data;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Map CLOB market tokens to [awayTokenId, homeTokenId] by matching outcome to team names
+function mapClobTokensToAwayHome(clobTokens, awayTeam, homeTeam) {
+  if (!Array.isArray(clobTokens) || clobTokens.length < 2) return [];
+  const away = String(awayTeam || '').toUpperCase();
+  const home = String(homeTeam || '').toUpperCase();
+  let awayToken = null;
+  let homeToken = null;
+  for (const t of clobTokens) {
+    const outcome = String(t?.outcome || '').toUpperCase();
+    const tokenId = normalizePolyTokenId(t?.token_id ?? t?.tokenId);
+    if (!tokenId) continue;
+    if (outcome.includes(away) && !outcome.includes(home)) awayToken = tokenId;
+    else if (outcome.includes(home) && !outcome.includes(away)) homeToken = tokenId;
+  }
+  if (awayToken && homeToken) return [awayToken, homeToken];
+  return [normalizePolyTokenId(clobTokens[0]?.token_id ?? clobTokens[0]?.tokenId), normalizePolyTokenId(clobTokens[1]?.token_id ?? clobTokens[1]?.tokenId)].filter(Boolean);
+}
+
 // Extract [awayToken, homeToken] from market or event; Gamma API can use clobTokenIds, tokens, or one token per market in multi-outcome events
 function parseMarketTokenIds(market, event, awayTeam, homeTeam) {
+  const markets = event?.markets || [];
   let tokenIds = market?.clobTokenIds ?? market?.tokens;
   if (typeof tokenIds === 'string') {
     try {
@@ -237,10 +272,12 @@ function parseMarketTokenIds(market, event, awayTeam, homeTeam) {
       tokenIds = tokenIds.split(',').map((s) => s.trim()).filter(Boolean);
     }
   }
-  if (Array.isArray(tokenIds) && tokenIds.length >= 2) {
+  // For single-market (binary) events: clobTokenIds[0]=awayYES, [1]=homeYES — use directly.
+  // For multi-market (negRisk) events: skip to the title-matching loop below so each team's YES token
+  // is found correctly. Without this guard, [1] would be AWAY_NO, not HOME_YES.
+  if (Array.isArray(tokenIds) && tokenIds.length >= 2 && markets.length <= 1) {
     return [normalizePolyTokenId(tokenIds[0]), normalizePolyTokenId(tokenIds[1])].filter(Boolean);
   }
-  const markets = event?.markets || [];
   let awayToken = null;
   let homeToken = null;
   for (const m of markets) {
@@ -319,8 +356,9 @@ function mapPricesToAwayHome(prices, outcomes, event, awayAbbr, homeAbbr) {
   return { awayOdds: awayPrice, homeOdds: homePrice };
 }
 
-// Build a Polymarket game from Gamma API event (for tag-based fetch when no today games)
-function buildPolyGameFromEvent(event) {
+// Build a Polymarket game from Gamma API event. Uses CLOB getMarket(condition_id) to validate tokens (Kushak1 architecture).
+// Pass knownAway/knownHome (NBA tricodes) when available to avoid extracting wrong abbreviations from titles like "Jazz vs. Nuggets"
+async function buildPolyGameFromEvent(event, knownAway, knownHome) {
   const market = findMoneylineMarket(event.markets);
   if (!market) return null;
   const pricesRaw = market?.outcomePrices ?? market?.outcome_prices;
@@ -328,22 +366,39 @@ function buildPolyGameFromEvent(event) {
   const outcomes = parseOutcomes(market?.outcomes ?? market?.outcome);
   const slug = event.slug || event.id || '';
   const slugMatch = slug.match(/nba-(\w+)-(\w+)-/);
-  let awayTeam = (slugMatch && slugMatch[1] ? slugMatch[1].toUpperCase() : null) || event.teams?.[0]?.abbreviation || event.teams?.[0]?.name?.slice(0, 3)?.toUpperCase() || 'AWAY';
-  let homeTeam = (slugMatch && slugMatch[2] ? slugMatch[2].toUpperCase() : null) || event.teams?.[1]?.abbreviation || event.teams?.[1]?.name?.slice(0, 3)?.toUpperCase() || 'HOME';
-  const title = event.title || market?.question || '';
-  const vsMatch = title.match(/(.+?)\s+vs\.?\s+(.+)/i);
-  if (vsMatch) {
-    awayTeam = String(vsMatch[1]).trim().slice(0, 3).toUpperCase() || awayTeam;
-    homeTeam = String(vsMatch[2]).trim().slice(0, 3).toUpperCase() || homeTeam;
+  let awayTeam = (knownAway && knownAway.toUpperCase()) || (slugMatch && slugMatch[1] ? slugMatch[1].toUpperCase() : null) || event.teams?.[0]?.abbreviation || event.teams?.[0]?.name?.slice(0, 3)?.toUpperCase() || 'AWAY';
+  let homeTeam = (knownHome && knownHome.toUpperCase()) || (slugMatch && slugMatch[2] ? slugMatch[2].toUpperCase() : null) || event.teams?.[1]?.abbreviation || event.teams?.[1]?.name?.slice(0, 3)?.toUpperCase() || 'HOME';
+  // Only use title extraction as fallback when tricodes aren't already known — titles like "Jazz vs. Nuggets" produce "JAZ"/"NUG" which won't match NBA tricodes
+  if (!knownAway || !knownHome) {
+    const title = event.title || market?.question || '';
+    const vsMatch = title.match(/(.+?)\s+vs\.?\s+(.+)/i);
+    if (vsMatch) {
+      awayTeam = String(vsMatch[1]).trim().slice(0, 3).toUpperCase() || awayTeam;
+      homeTeam = String(vsMatch[2]).trim().slice(0, 3).toUpperCase() || homeTeam;
+    }
   }
   const { awayOdds, homeOdds } = mapPricesToAwayHome(prices, outcomes, event, awayTeam, homeTeam);
-  const tokenIdArr = parseMarketTokenIds(market, event, awayTeam, homeTeam);
-  const tickSize = market?.minimum_tick_size ?? market?.tickSize ?? '0.01';
-  const negRisk = Boolean(market?.neg_risk ?? market?.negRisk);
-  const betting =
-    tokenIdArr.length >= 2
-      ? { tokenIdAway: tokenIdArr[0], tokenIdHome: tokenIdArr[1], tickSize: String(tickSize), negRisk }
-      : null;
+  let betting = null;
+  const conditionId = market?.conditionId ?? market?.condition_id ?? event?.conditionId ?? event?.condition_id;
+  if (conditionId) {
+    const clobMarket = await fetchClobMarket(conditionId);
+    if (clobMarket?.tokens) {
+      const tokenIdArr = mapClobTokensToAwayHome(clobMarket.tokens, awayTeam, homeTeam);
+      const tickSize = clobMarket.minimum_tick_size ?? clobMarket.min_tick_size ?? market?.minimum_tick_size ?? market?.tickSize ?? '0.01';
+      const negRisk = Boolean(clobMarket.neg_risk ?? clobMarket.negRisk ?? market?.neg_risk ?? market?.negRisk);
+      if (tokenIdArr.length >= 2) {
+        betting = { tokenIdAway: tokenIdArr[0], tokenIdHome: tokenIdArr[1], tickSize: String(tickSize), negRisk };
+      }
+    }
+  }
+  if (!betting) {
+    const tokenIdArr = parseMarketTokenIds(market, event, awayTeam, homeTeam);
+    const tickSize = market?.minimum_tick_size ?? market?.tickSize ?? '0.01';
+    const negRisk = Boolean(market?.neg_risk ?? market?.negRisk);
+    if (tokenIdArr.length >= 2) {
+      betting = { tokenIdAway: tokenIdArr[0], tokenIdHome: tokenIdArr[1], tickSize: String(tickSize), negRisk };
+    }
+  }
   const game = {
     id: event.id || slug,
     homeTeam,
@@ -361,25 +416,61 @@ function buildPolyGameFromEvent(event) {
   return game;
 }
 
-// Fetch NBA game odds from Polymarket - always include tag-based events so Poly column fills for all matchups
+// Simple in-memory cache for /api/polymarket (avoids re-fetching all external APIs on every page load)
+let polymarketCache = null;
+let polymarketCacheTime = 0;
+// Call this whenever you need to force a fresh fetch (e.g. after a bug fix)
+function bustPolymarketCache() { polymarketCache = null; polymarketCacheTime = 0; }
+const POLYMARKET_CACHE_TTL_MS = 30000; // 30 seconds
+
+// Fetch NBA game odds from Polymarket - look up each upcoming game by slug (tag_id=745 returns 422)
 app.get('/api/polymarket', async (req, res) => {
+  if (polymarketCache && Date.now() - polymarketCacheTime < POLYMARKET_CACHE_TTL_MS) {
+    return res.json(polymarketCache);
+  }
   try {
     const byKey = new Map(); // key = AWAY-HOME (e.g. ORL-ATL)
 
-    // 1. Always fetch active NBA events from Gamma by tag (so every upcoming matchup has Poly odds)
-    const tagRes = await fetch(
-      `https://gamma-api.polymarket.com/events?tag_id=${POLYMARKET_NBA_TAG}&active=true&closed=false&limit=50&order=start_date&ascending=true`,
-      fetchOptions
-    );
-    const tagEvents = await tagRes.json();
-    const eventList = Array.isArray(tagEvents) ? tagEvents : [];
-    for (const event of eventList) {
-      if (!event?.markets?.length) continue;
-      const game = buildPolyGameFromEvent(event);
-      if (game) {
-        const key = `${String(game.awayTeam).toUpperCase()}-${String(game.homeTeam).toUpperCase()}`;
-        byKey.set(key, game);
+    // 1. Fetch upcoming NBA games from schedule and look up each by Polymarket slug.
+    try {
+      const now = new Date();
+      const cutoff = new Date(now.getTime() + UPCOMING_DAYS * 24 * 60 * 60 * 1000);
+      const schedRes = await fetch(NBA_SCHEDULE_URL, fetchOptions);
+      const schedData = await schedRes.json();
+      const toFetch = [];
+      for (const day of schedData?.leagueSchedule?.gameDates || []) {
+        for (const g of day.games || []) {
+          const gameTime = g.gameDateTimeUTC ? new Date(g.gameDateTimeUTC) : null;
+          if (!gameTime || gameTime < now || gameTime > cutoff) continue;
+          const away = (g.awayTeam?.teamTricode || '').toUpperCase();
+          const home = (g.homeTeam?.teamTricode || '').toUpperCase();
+          if (!away || !home) continue;
+          // Use Eastern Time for the date — NBA games at 8pm+ ET are next UTC day, which breaks Polymarket slugs
+          const etDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(gameTime);
+          toFetch.push({ away, home, dateStr: etDateStr });
+        }
       }
+      await Promise.all(
+        toFetch.map(async ({ away, home, dateStr }) => {
+          const key = `${away}-${home}`;
+          if (byKey.has(key)) return;
+          const slug = `nba-${away.toLowerCase()}-${home.toLowerCase()}-${dateStr}`;
+          try {
+            const eventRes = await fetch(
+              `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`,
+              fetchOptions
+            );
+            const events = await eventRes.json();
+            const event = Array.isArray(events) ? events[0] : events;
+            if (event?.markets?.length) {
+              const game = await buildPolyGameFromEvent(event, away, home);
+              if (game) byKey.set(key, game);
+            }
+          } catch (_) {}
+        })
+      );
+    } catch (e) {
+      console.warn('Polymarket schedule slug fetch failed:', e.message);
     }
 
     // 2. If today's scoreboard has games, overlay slug-fetched data (scores + slug-specific odds)
@@ -411,13 +502,27 @@ app.get('/api/polymarket', async (req, res) => {
               const prices = parseOutcomePrices(pricesRaw);
               const outcomes = parseOutcomes(market?.outcomes ?? market?.outcome);
               const { awayOdds, homeOdds } = mapPricesToAwayHome(prices, outcomes, event, away, home);
-              const tokenIdArr = parseMarketTokenIds(market, event, away, home);
-              const tickSize = market?.minimum_tick_size ?? market?.tickSize ?? '0.01';
-              const negRisk = Boolean(market?.neg_risk ?? market?.negRisk);
-              const betting =
-                tokenIdArr.length >= 2
-                  ? { tokenIdAway: tokenIdArr[0], tokenIdHome: tokenIdArr[1], tickSize: String(tickSize), negRisk }
-                  : null;
+              let betting = null;
+              const conditionId = market?.conditionId ?? market?.condition_id ?? event?.conditionId ?? event?.condition_id;
+              if (conditionId) {
+                const clobMarket = await fetchClobMarket(conditionId);
+                if (clobMarket?.tokens) {
+                  const tokenIdArr = mapClobTokensToAwayHome(clobMarket.tokens, away, home);
+                  const tickSize = clobMarket.minimum_tick_size ?? clobMarket.min_tick_size ?? market?.minimum_tick_size ?? market?.tickSize ?? '0.01';
+                  const negRisk = Boolean(clobMarket.neg_risk ?? clobMarket.negRisk ?? market?.neg_risk ?? market?.negRisk);
+                  if (tokenIdArr.length >= 2) {
+                    betting = { tokenIdAway: tokenIdArr[0], tokenIdHome: tokenIdArr[1], tickSize: String(tickSize), negRisk };
+                  }
+                }
+              }
+              if (!betting) {
+                const tokenIdArr = parseMarketTokenIds(market, event, away, home);
+                const tickSize = market?.minimum_tick_size ?? market?.tickSize ?? '0.01';
+                const negRisk = Boolean(market?.neg_risk ?? market?.negRisk);
+                if (tokenIdArr.length >= 2) {
+                  betting = { tokenIdAway: tokenIdArr[0], tokenIdHome: tokenIdArr[1], tickSize: String(tickSize), negRisk };
+                }
+              }
               const built = buildGameWithScores(g, event.id || slug, home, away, Math.round(homeOdds * 100) / 100, Math.round(awayOdds * 100) / 100, event.startDate || g?.gameTimeUTC, `https://polymarket.com/event/${slug}`, betting);
               built.label = 'Moneyline';
               byKey.set(key, built);
@@ -434,7 +539,10 @@ app.get('/api/polymarket', async (req, res) => {
     }
 
     const games = Array.from(byKey.values()).sort((a, b) => new Date(a.startDate || 0) - new Date(b.startDate || 0));
-    res.json({ games });
+    const result = { games };
+    polymarketCache = result;
+    polymarketCacheTime = Date.now();
+    res.json(result);
   } catch (error) {
     console.error('Polymarket API error:', error.message);
     res.status(500).json({ error: 'Failed to fetch Polymarket data', games: [] });
@@ -790,6 +898,12 @@ app.post('/api/arb/execute', async (req, res) => {
   const stakePoly = Number(opp.stakePolyUsd) || 0;
   const polyPrice = Number(opp.polyPrice) || 0.5;
   const polySize = Math.max(1, Math.floor(stakePoly / Math.max(0.01, polyPrice)));
+  const polyNotional = polySize * polyPrice;
+  if (polyNotional < 1) {
+    return res.status(400).json({
+      error: `Polymarket minimum order is $1 notional. This arb stake would be $${polyNotional.toFixed(2)}. Increase ARB_MAX_STAKE_PER_ARB_USD or choose a larger opportunity.`,
+    });
+  }
 
   try {
     const base = `${req.protocol}://${req.get('host')}`;
@@ -809,7 +923,12 @@ app.post('/api/arb/execute', async (req, res) => {
     });
     const polyResult = await polyOrderRes.json().catch(() => ({}));
     if (!polyOrderRes.ok) {
-      return res.status(polyOrderRes.status).json({ error: polyResult.error || 'Polymarket order failed' });
+      const polyErr = polyResult.error || 'Polymarket order failed';
+      const polyFix = polyResult.fix || '';
+      return res.status(polyOrderRes.status).json({
+        error: polyFix ? `${polyErr}\n\n${polyFix}` : polyErr,
+        polyResult: { error: polyErr, fix: polyFix, detail: polyResult.detail },
+      });
     }
 
     const kalshiOrderRes = await fetch(`${base}/api/kalshi/order`, {
@@ -888,6 +1007,40 @@ app.get('/api/odds', async (req, res) => {
 
 // ---------- Auth & place-order (sign in to bet) ----------
 
+// Fetch Polymarket profile to get proxy wallet (for email/Magic sign-in). Balance/allowance live in the proxy.
+async function getPolyFunderAddress(ethAddress) {
+  if (!ethAddress || typeof ethAddress !== 'string') return null;
+  const addr = String(ethAddress).trim();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return null;
+  try {
+    const res = await fetch(
+      `https://gamma-api.polymarket.com/public-profile?address=${encodeURIComponent(addr)}`,
+      fetchOptions
+    );
+    const data = await res.json().catch(() => ({}));
+    const proxy = data?.proxyWallet ?? data?.proxy_wallet;
+    if (proxy && /^0x[a-fA-F0-9]{40}$/.test(String(proxy).trim())) return String(proxy).trim().toLowerCase();
+  } catch (_) {}
+  return null;
+}
+
+// Build wallet + apiCreds + funder from session. Funder = proxy if email sign-in, else EOA.
+async function getPolyWalletAndFunder(req) {
+  const creds = req.session?.polyCreds;
+  if (!creds) return null;
+  const { Wallet } = await import('ethers');
+  const wallet = new Wallet(String(creds.privateKey).trim());
+  const apiCreds = {
+    key: String(creds.apiKey ?? '').trim(),
+    secret: String(creds.secret ?? '').trim(),
+    passphrase: String(creds.passphrase ?? '').trim(),
+  };
+  const funder = (req.session?.polyFunder && /^0x[a-fA-F0-9]{40}$/.test(String(req.session.polyFunder)))
+    ? String(req.session.polyFunder).trim().toLowerCase()
+    : wallet.address.toLowerCase();
+  return { wallet, apiCreds, funder };
+}
+
 app.get('/api/auth/status', (req, res) => {
   res.json({
     polymarket: Boolean(req.session?.polyCreds),
@@ -895,31 +1048,26 @@ app.get('/api/auth/status', (req, res) => {
   });
 });
 
-// Balances (when signed in)
+// Balances (when signed in). Use proxy as funder if email/Magic sign-in so we see the right balance.
 app.get('/api/balances', async (req, res) => {
   const result = { polymarket: null, kalshi: null };
-  if (req.session?.polyCreds) {
+  const poly = await getPolyWalletAndFunder(req);
+  if (poly) {
     try {
       const { ClobClient, AssetType } = await import('@polymarket/clob-client');
-      const { Wallet } = await import('ethers');
-      const creds = req.session.polyCreds;
-      const wallet = new Wallet(creds.privateKey);
-      const apiCreds = {
-        key: String(creds.apiKey ?? '').trim(),
-        secret: String(creds.secret ?? '').trim(),
-        passphrase: String(creds.passphrase ?? '').trim(),
-      };
+      const { wallet, apiCreds, funder } = poly;
       let balanceUsdc = 0;
       let allowanceUsdc = 0;
-      // Polymarket uses signature_type: 0=EOA, 1=Email/Magic, 2=Browser proxy. Try all if first returns 0.
-      for (const sigType of [0, 1, 2]) {
+      const isProxy = funder !== wallet.address.toLowerCase();
+      const sigOrder = isProxy ? [1, 0, 2] : [0, 1, 2];
+      for (const sigType of sigOrder) {
         const client = new ClobClient(
           'https://clob.polymarket.com',
           137,
           wallet,
           apiCreds,
           sigType,
-          wallet.address
+          funder
         );
         const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
         const balanceWei = BigInt(bal?.balance ?? 0);
@@ -936,8 +1084,8 @@ app.get('/api/balances', async (req, res) => {
       result.polymarket = {
         balanceUsdc,
         allowanceUsdc,
-        walletAddress: wallet.address,
-        ...(balanceUsdc === 0 && { hint: `Balance is $0. Send USDC (Polygon) to ${wallet.address}, or create an API key from the wallet that has the funds.` }),
+        walletAddress: funder,
+        ...(balanceUsdc === 0 && { hint: `Balance is $0. Send USDC (Polygon) to ${funder}${isProxy ? ' (your Polymarket profile address)' : ''}, or use an API key from the wallet that has the funds.` }),
         ...(needAllowance && { hint: 'Enable USDC for trading: click Enable USDC and confirm both popups, or use the manual Polygonscan links.' }),
       };
     } catch (err) {
@@ -987,18 +1135,14 @@ app.get('/api/balances', async (req, res) => {
 // My orders (open orders + recent) for dashboard
 app.get('/api/my-orders', async (req, res) => {
   const result = { polymarket: { orders: [], error: null }, kalshi: { orders: [], error: null } };
-  if (req.session?.polyCreds) {
+  const poly = await getPolyWalletAndFunder(req);
+  if (poly) {
     try {
       const { ClobClient } = await import('@polymarket/clob-client');
-      const { Wallet } = await import('ethers');
-      const creds = req.session.polyCreds;
-      const wallet = new Wallet(creds.privateKey);
-      const apiCreds = {
-        key: String(creds.apiKey ?? '').trim(),
-        secret: String(creds.secret ?? '').trim(),
-        passphrase: String(creds.passphrase ?? '').trim(),
-      };
-      const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, 0, wallet.address);
+      const { wallet, apiCreds, funder } = poly;
+      const isProxy = funder !== wallet.address.toLowerCase();
+      const sigType = isProxy ? 1 : 0;
+      const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funder);
       const raw = await client.getOpenOrders({}, true);
       const orders = Array.isArray(raw) ? raw : [];
       result.polymarket.orders = orders.map((o) => ({
@@ -1050,8 +1194,8 @@ app.get('/api/my-orders', async (req, res) => {
   res.json(result);
 });
 
-app.post('/api/auth/polymarket', (req, res) => {
-  const { apiKey, secret, passphrase, privateKey } = req.body || {};
+app.post('/api/auth/polymarket', async (req, res) => {
+  const { apiKey, secret, passphrase, privateKey, funderAddress } = req.body || {};
   if (!apiKey || !secret || !passphrase || !privateKey) {
     return res.status(400).json({ error: 'Missing apiKey, secret, passphrase, or privateKey' });
   }
@@ -1061,6 +1205,15 @@ app.post('/api/auth/polymarket', (req, res) => {
     passphrase: String(passphrase).trim(),
     privateKey: String(privateKey).trim(),
   };
+  delete req.session.polyFunder;
+  try {
+    const { Wallet } = await import('ethers');
+    const wallet = new Wallet(String(privateKey).trim());
+    if (funderAddress && /^0x[a-fA-F0-9]{40}$/.test(String(funderAddress).trim())) {
+      req.session.polyFunder = String(funderAddress).trim().toLowerCase();
+    }
+    // Do NOT auto-fetch proxy — MetaMask users use EOA; auto-detect was causing "invalid signature" for them
+  } catch (_) {}
   res.json({ ok: true });
 });
 
@@ -1086,24 +1239,20 @@ app.post('/api/auth/kalshi', (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => {
   delete req.session.polyCreds;
+  delete req.session.polyFunder;
   delete req.session.kalshiCreds;
   res.json({ ok: true });
 });
 
 // Ask CLOB to update USDC + CTF allowance. Returns both responses (may include transactions for frontend to send via MetaMask).
 app.post('/api/polymarket/update-allowance', async (req, res) => {
-  const creds = req.session?.polyCreds;
-  if (!creds) return res.status(401).json({ error: 'Not signed in to Polymarket' });
+  const poly = await getPolyWalletAndFunder(req);
+  if (!poly) return res.status(401).json({ error: 'Not signed in to Polymarket' });
   try {
     const { ClobClient, AssetType } = await import('@polymarket/clob-client');
-    const { Wallet } = await import('ethers');
-    const wallet = new Wallet(String(creds.privateKey).trim());
-    const apiCreds = {
-      key: String(creds.apiKey ?? '').trim(),
-      secret: String(creds.secret ?? '').trim(),
-      passphrase: String(creds.passphrase ?? '').trim(),
-    };
-    const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, 0, wallet.address);
+    const { wallet, apiCreds, funder } = poly;
+    const isProxy = funder !== wallet.address.toLowerCase();
+    const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, isProxy ? 1 : 0, funder);
     const collateral = await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
     const conditional = await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL });
     const needsSigning = collateral?.transaction || conditional?.transaction;
@@ -1130,10 +1279,19 @@ function polyTickSizeSupported(minTickStr) {
   return found || '0.1';
 }
 
-// Place order on Polymarket (requires session polyCreds)
+// Round price to Polymarket tick so the CLOB doesn't reject with INVALID_ORDER_MIN_TICK_SIZE.
+function roundPriceToTick(price, tickSizeStr) {
+  const p = Number(price);
+  const tick = parseFloat(tickSizeStr) || 0.01;
+  if (!Number.isFinite(p) || !Number.isFinite(tick) || tick <= 0) return p;
+  const decimals = tick >= 0.1 ? 1 : tick >= 0.01 ? 2 : tick >= 0.001 ? 3 : 4;
+  return Math.round(p * Math.pow(10, decimals)) / Math.pow(10, decimals);
+}
+
+// Place order on Polymarket (requires session polyCreds). Uses proxy as funder when email/Magic sign-in.
 app.post('/api/polymarket/order', async (req, res) => {
-  const creds = req.session?.polyCreds;
-  if (!creds) return res.status(401).json({ error: 'Not signed in to Polymarket' });
+  const poly = await getPolyWalletAndFunder(req);
+  if (!poly) return res.status(401).json({ error: 'Not signed in to Polymarket' });
 
   const { tokenId, side, price, size: sizeRaw, sizeInDollars } = req.body || {};
   if (!tokenId || !side || price == null) {
@@ -1151,50 +1309,82 @@ app.post('/api/polymarket/order', async (req, res) => {
   if (!Number.isFinite(size) || size <= 0) {
     return res.status(400).json({ error: 'Missing or invalid size (shares), or sizeInDollars' });
   }
+  const notionalUsd = priceNum * Number(size);
+  if (notionalUsd < 1) {
+    return res.status(400).json({
+      error: `Polymarket minimum order notional is $1. Your order is $${notionalUsd.toFixed(2)}. Increase size or use at least $1 notional.`,
+    });
+  }
 
   try {
     const { ClobClient, Side, OrderType } = await import('@polymarket/clob-client');
-    const { Wallet } = await import('ethers');
-
-    const wallet = new Wallet(String(creds.privateKey).trim());
-    const apiCreds = {
-      key: String(creds.apiKey ?? '').trim(),
-      secret: String(creds.secret ?? '').trim(),
-      passphrase: String(creds.passphrase ?? '').trim(),
-    };
+    const { wallet, apiCreds, funder } = poly;
+    const isProxy = funder !== wallet.address.toLowerCase();
+    // Always try EOA (sig 0) first — proxy sig has no on-chain USDC in the GnosisSafe proxy wallet.
+    const attempts = [
+      { sigType: 0, funderAddr: wallet.address },
+      ...(isProxy ? [{ sigType: 1, funderAddr: funder }, { sigType: 2, funderAddr: funder }] : [{ sigType: 1, funderAddr: wallet.address }, { sigType: 2, funderAddr: wallet.address }]),
+    ];
 
     const tokenIdStr = normalizePolyTokenId(tokenId) || String(tokenId).trim();
     if (!tokenIdStr) return res.status(400).json({ error: 'Invalid or missing token id' });
     const negRisk = Boolean(req.body.negRisk);
     const sideVal = (side || '').toUpperCase() === 'SELL' ? Side.SELL : Side.BUY;
-    const userOrder = { tokenID: tokenIdStr, price: priceNum, size: Number(size), side: sideVal };
+    const sizeNum = Number(size);
+    const userOrder = { tokenID: tokenIdStr, price: priceNum, size: sizeNum, side: sideVal };
     const optionsBase = { negRisk };
 
     let lastErr = null;
-    for (const sigType of [0, 1, 2]) {
+    for (const { sigType, funderAddr } of attempts) {
       const client = new ClobClient(
         'https://clob.polymarket.com',
         137,
         wallet,
         apiCreds,
         sigType,
-        wallet.address
+        funderAddr
       );
+      try { await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL }); } catch (_) {}
       let tickSize = String(req.body.tickSize ?? '0.01');
       try {
         const minTick = await client.getTickSize(tokenIdStr);
         if (minTick != null) tickSize = polyTickSizeSupported(String(minTick));
-      } catch (_) {}
+      } catch (tickErr) {
+        const tickMsg = tickErr?.response?.data?.error || tickErr?.message || '';
+        if (/orderbook.*does not exist|does not exist/i.test(tickMsg)) {
+          return res.status(400).json({
+            error: "This market's orderbook no longer exists — the game may have started or the market closed.",
+            fix: 'Try a different game that has not started yet, or refresh the page to get the latest odds.',
+          });
+        }
+      }
       if (!POLY_SUPPORTED_TICK_SIZES.includes(tickSize)) tickSize = polyTickSizeSupported(tickSize);
+      userOrder.price = roundPriceToTick(userOrder.price, tickSize);
       const options = { ...optionsBase, tickSize };
       try {
         const response = await client.createAndPostOrder(userOrder, options, OrderType.GTC);
+        const responseErr = response?.error || response?.errorMsg;
+        if (responseErr) {
+          lastErr = Object.assign(new Error(String(responseErr)), { responseObj: response });
+          if (/invalid signature/i.test(String(responseErr))) continue;
+          throw lastErr;
+        }
+        console.log('\n=== ORDER RESPONSE ===', JSON.stringify(response, null, 2), '=== END ===\n');
         return res.json(response);
       } catch (err) {
         lastErr = err;
-        if (err?.response?.status === 401 || err?.response?.status === 403) continue;
+        const errMsg = err?.response?.data?.error || err?.message || '';
+        const isInvalidSig = /invalid signature/i.test(errMsg);
+        if (err?.response?.status === 401 || err?.response?.status === 403 || isInvalidSig) continue;
         throw err;
       }
+    }
+    const finalMsg = lastErr?.response?.data?.error || lastErr?.message || '';
+    if (/invalid signature/i.test(finalMsg)) {
+      return res.status(400).json({
+        error: 'Invalid signature — the Polymarket SDK has a known bug with email/Google sign-in (proxy) accounts.',
+        fix: 'Use a MetaMask wallet instead: create a new wallet, send USDC (Polygon) to it, derive an API key from that wallet, and sign in with those credentials. Leave Profile address blank.',
+      });
     }
     throw lastErr;
   } catch (err) {
@@ -1202,35 +1392,32 @@ app.post('/api/polymarket/order', async (req, res) => {
     const body = err?.response?.data;
     console.error('Polymarket order error:', err?.message, 'status:', status, 'body:', body);
     const msg =
+      (body && typeof body.errorMsg === 'string' && body.errorMsg) ||
       (typeof err === 'object' && err != null && typeof err.error === 'string' && err.error) ||
       (body && typeof body.error === 'string' && body.error) ||
       (body && typeof body.message === 'string' && body.message) ||
       err?.message ||
       'Order failed';
+    const isOrderbookMissing = /orderbook.*does not exist|does not exist/i.test(msg);
+    if (isOrderbookMissing) {
+      return res.status(400).json({
+        error: "This market's orderbook no longer exists — the game may have started or the market closed.",
+        fix: 'Try a different game that has not started yet, or refresh the page to get the latest odds.',
+      });
+    }
     const isAllowanceError = /not enough balance \/ allowance/i.test(msg);
     let balanceAllowance = null;
     let walletAddress = null;
     if (isAllowanceError) {
       console.log('\n========== NOT ENOUGH BALANCE/ALLOWANCE — checking what CLOB sees ==========');
-      if (req.session?.polyCreds) {
-        try {
-          const { Wallet } = await import('ethers');
-          const wallet = new Wallet(String(req.session.polyCreds.privateKey).trim());
-          walletAddress = wallet.address;
-          console.log('API key wallet address:', walletAddress);
-        } catch (e1) {
-          console.log('Could not get wallet address:', e1?.message);
-        }
+      const polyErr = await getPolyWalletAndFunder(req);
+      if (polyErr) {
+        walletAddress = polyErr.funder;
+        console.log('Funder address (where balance is checked):', walletAddress);
         try {
           const { ClobClient, AssetType } = await import('@polymarket/clob-client');
-          const { Wallet } = await import('ethers');
-          const wallet = new Wallet(String(req.session.polyCreds.privateKey).trim());
-          const apiCreds = {
-            key: String(req.session.polyCreds.apiKey ?? '').trim(),
-            secret: String(req.session.polyCreds.secret ?? '').trim(),
-            passphrase: String(req.session.polyCreds.passphrase ?? '').trim(),
-          };
-          const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, 0, wallet.address);
+          const isProxy = polyErr.funder !== polyErr.wallet.address.toLowerCase();
+          const client = new ClobClient('https://clob.polymarket.com', 137, polyErr.wallet, polyErr.apiCreds, isProxy ? 1 : 0, polyErr.funder);
           const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
           const balanceUsdc = Number(BigInt(bal?.balance ?? 0)) / 1e6;
           const allowanceUsdc = Number(BigInt(bal?.allowance ?? 0)) / 1e6;
@@ -1252,9 +1439,9 @@ app.post('/api/polymarket/order', async (req, res) => {
     const fix = isAllowanceError
       ? balanceAllowance
         ? balanceAllowance.balanceUsdc === 0
-          ? `Your API key wallet has $0 USDC on Polygon. Send USDC to ${walletAddress || 'your API key address'} on Polygon (e.g. from an exchange or another wallet). Or create an API key from the wallet that already has USDC (run: POLY_PRIVATE_KEY=0x... node scripts/polymarket-create-api-key.js).`
-          : `CLOB sees balance: $${balanceAllowance.balanceUsdc.toFixed(2)} USDC, allowance: $${balanceAllowance.allowanceUsdc.toFixed(2)}. If allowance is $0, wait 30s and retry.`
-        : `Orders use wallet ${walletAddress || 'from your API key'} — it must hold USDC on Polygon. Send USDC to that address on Polygon, or use an API key from the wallet that has the funds.`
+          ? `Send USDC (Polygon) to ${walletAddress || 'your Polymarket profile address'}. If you use email/Google sign-in, add your profile address in Sign in → Profile address.`
+          : `CLOB sees balance: $${balanceAllowance.balanceUsdc.toFixed(2)} USDC, allowance: $${balanceAllowance.allowanceUsdc.toFixed(2)}. If allowance is $0, click Enable USDC and retry.`
+        : `Orders use ${walletAddress || 'your profile address'} — it must hold USDC on Polygon. If you use email sign-in, add your Polymarket profile address in Sign in.`
       : undefined;
     res.status(status === 403 ? 403 : status === 401 ? 401 : 500).json({
       error: msg,
