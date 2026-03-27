@@ -336,11 +336,133 @@ const ARB_PAST_MAX = 50; // max past opportunities to keep
 const arbStaleMap = new Map(); // key = gameKey+strategy, value = { ...opp, staleUntil }
 let arbPastOpportunities = []; // { ...opp, lastSeenAt } newest first, capped at ARB_PAST_MAX
 const closedOrderbooks = new Set(); // token IDs with no CLOB orderbook — skip these in arb display
+const autoArbPlaced = new Set(); // gameKey+strategy keys already auto-placed this session
+let autoArbEnabled = false;
 let arbPollTimerId = null;
 let arbFetchInFlight = false;
 let arbPendingManualCheck = false;
 let arbShowCheckingIndicator = false;
 let arbUserHasClickedCheck = false; // only show indicator after user has clicked "Check arb" at least once
+
+// ── Live Arb Engine ───────────────────────────────────────────────────────────
+let engineRunning = false;
+let engineSSE = null;
+let engineStats = { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, expectedProfitUsd: 0 };
+let engineFeed = [];
+
+function renderEngineStats() {
+  const el = document.getElementById('engineStats');
+  if (!el) return;
+  if (!engineRunning && engineStats.betsPlaced === 0) { el.innerHTML = ''; return; }
+  el.innerHTML = `
+    <span>Bets placed: <strong>${engineStats.betsPlaced}</strong></span>
+    <span>Expected profit: <strong>$${(engineStats.expectedProfitUsd || 0).toFixed(2)}</strong></span>
+    <span>Total staked: <strong>$${(engineStats.totalStakedUsd || 0).toFixed(2)}</strong></span>
+    <span>Attempted: <strong>${engineStats.betsAttempted}</strong></span>
+  `;
+}
+
+function renderEngineFeed() {
+  const el = document.getElementById('engineFeed');
+  const wrap = document.getElementById('engineFeedWrap');
+  if (!el || !wrap) return;
+  wrap.style.display = engineFeed.length ? 'block' : 'none';
+  el.innerHTML = engineFeed.slice(0, 50).map((ev) => {
+    const time = new Date(ev.ts).toLocaleTimeString();
+    if (ev.type === 'bet_placed') {
+      return `<div class="engine-feed-item success">[${time}] ✓ ${ev.strategyLabel} — staked $${(ev.stakePolyUsd||0).toFixed(2)}+$${(ev.stakeKalshiUsd||0).toFixed(2)} | profit ~$${(ev.netProfitUsd||0).toFixed(2)}</div>`;
+    } else if (ev.type === 'bet_failed') {
+      return `<div class="engine-feed-item error">[${time}] ✗ ${ev.gameKey} — poly: ${ev.polyErr||'ok'} kal: ${ev.kalErr||'ok'}</div>`;
+    } else if (ev.type === 'tick') {
+      return `<div class="engine-feed-item">[${time}] tick — ${ev.opportunityCount} opps | Poly $${(ev.polyBal||0).toFixed(2)} Kal $${(ev.kalBal||0).toFixed(2)}</div>`;
+    } else if (ev.type === 'stopped') {
+      return `<div class="engine-feed-item error">[${time}] STOPPED — ${ev.reason}</div>`;
+    } else if (ev.type === 'error') {
+      return `<div class="engine-feed-item error">[${time}] ERROR — ${ev.message}</div>`;
+    }
+    if (ev.type === 'state' || ev.type === 'started' || ev.type === 'config_updated') return '';
+    return `<div class="engine-feed-item">[${time}] ${ev.type}</div>`;
+  }).filter(Boolean).join('');
+}
+
+function updateEngineUI() {
+  const startBtn = document.getElementById('engineStartBtn');
+  const stopBtn = document.getElementById('engineStopBtn');
+  const badge = document.getElementById('engineStatusBadge');
+  if (!startBtn) return;
+  startBtn.disabled = engineRunning;
+  stopBtn.disabled = !engineRunning;
+  if (badge) {
+    badge.textContent = engineRunning ? '🟢 Running' : '⚫ Stopped';
+    badge.style.color = engineRunning ? 'var(--green)' : 'var(--muted)';
+  }
+  renderEngineStats();
+  renderEngineFeed();
+}
+
+function openEngineSSE() {
+  if (engineSSE) { engineSSE.close(); engineSSE = null; }
+  engineSSE = new EventSource('/api/arb/engine/stream');
+  engineSSE.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      engineFeed.unshift(ev);
+      if (engineFeed.length > 100) engineFeed.pop();
+      if (ev.stats) engineStats = ev.stats;
+      if (ev.type === 'stopped' || ev.type === 'circuit_breaker') {
+        engineRunning = false;
+        if (engineSSE) { engineSSE.close(); engineSSE = null; }
+      }
+      updateEngineUI();
+    } catch (_) {}
+  };
+  engineSSE.onerror = () => {
+    // SSE will auto-reconnect; just update UI if engine stopped
+    if (!engineRunning) { if (engineSSE) { engineSSE.close(); engineSSE = null; } }
+  };
+}
+
+async function startEngine() {
+  if (!authState.polymarket || !authState.kalshi) {
+    alert('Sign in to both Polymarket and Kalshi first.');
+    return;
+  }
+  const config = {
+    betSizeUsd: parseFloat(document.getElementById('engineBetSize')?.value) || 2,
+    intervalMs: parseInt(document.getElementById('engineInterval')?.value) || 3000,
+    cooldownMs: parseInt(document.getElementById('engineCooldown')?.value) || 30000,
+    kellyFraction: parseFloat(document.getElementById('engineKelly')?.value) || 0.25,
+    circuitBreakerPolyUsd: parseFloat(document.getElementById('engineCircuitPoly')?.value) || 5,
+    circuitBreakerKalUsd: parseFloat(document.getElementById('engineCircuitKal')?.value) || 5,
+  };
+  try {
+    const res = await fetch(`${API_BASE}/api/arb/engine/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ config }),
+    });
+    const data = await res.json();
+    if (!res.ok) { alert(data.error || 'Failed to start engine'); return; }
+    engineRunning = true;
+    engineFeed = [];
+    engineStats = { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, expectedProfitUsd: 0 };
+    openEngineSSE();
+    updateEngineUI();
+  } catch (err) {
+    alert('Engine start failed: ' + err.message);
+  }
+}
+
+async function stopEngine() {
+  try {
+    await fetch(`${API_BASE}/api/arb/engine/stop`, { method: 'POST', credentials: 'include' });
+  } catch (_) {}
+  engineRunning = false;
+  if (engineSSE) { engineSSE.close(); engineSSE = null; }
+  updateEngineUI();
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchArbOpportunities(silent = false) {
   if (arbFetchInFlight) {
@@ -374,6 +496,17 @@ async function fetchArbOpportunities(silent = false) {
     for (const o of prev) {
       const key = `${o.gameKey}-${o.strategy}`;
       if (!newKeys.has(key)) arbStaleMap.set(key, { ...o, staleUntil: Date.now() + ARB_STALE_KEEP_MS });
+    }
+
+    // Auto-arb: place new opportunities automatically if enabled
+    if (autoArbEnabled && authState.polymarket && authState.kalshi) {
+      for (const opp of newList) {
+        const key = `${opp.gameKey}-${opp.strategy}`;
+        if (!autoArbPlaced.has(key)) {
+          autoArbPlaced.add(key);
+          placeArb(opp, null, true); // silent auto-place
+        }
+      }
     }
     for (const key of arbStaleMap.keys()) {
       if (arbStaleMap.get(key).staleUntil < Date.now()) arbStaleMap.delete(key);
@@ -593,9 +726,9 @@ function renderArbOpportunities() {
   }
 }
 
-async function placeArb(opp, btnEl) {
+async function placeArb(opp, btnEl, silent = false) {
   if (!authState.polymarket || !authState.kalshi) {
-    alert('Sign in to both Polymarket and Kalshi to place an arb.');
+    if (!silent) alert('Sign in to both Polymarket and Kalshi to place an arb.');
     return;
   }
   if (btnEl) {
@@ -625,18 +758,22 @@ async function placeArb(opp, btnEl) {
         return;
       }
       if (data.leg1Done) {
-        alert(`Warning: Poly leg filled but Kalshi failed. ${msg}`);
-      } else {
+        showToast(`⚠️ Poly leg filled but Kalshi failed. ${msg}`, 'error');
+      } else if (!silent) {
         alert(msg);
+      } else {
+        showToast(`Auto-arb failed: ${msg}`, 'error');
       }
       return;
     }
-    alert('Arb placed. Poly and Kalshi orders submitted.');
+    showToast(`✅ Arb placed — ${opp.awayTeam} @ ${opp.homeTeam} · +$${opp.netProfitUsd} expected`);
     await fetchAuthStatus();
     fetchMyOrders();
     fetchArbOpportunities();
+    fetchArbHistory();
   } catch (err) {
-    alert(err?.message || 'Arb execute failed');
+    if (!silent) alert(err?.message || 'Arb execute failed');
+    else showToast(`Auto-arb error: ${err?.message || 'failed'}`, 'error');
   } finally {
     if (btnEl) {
       btnEl.disabled = false;
@@ -644,6 +781,72 @@ async function placeArb(opp, btnEl) {
     }
   }
 }
+
+// ── Toast notifications ───────────────────────────────────────────────────
+function showToast(msg, type = 'success') {
+  let container = document.getElementById('toastContainer');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toastContainer';
+    container.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;';
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement('div');
+  toast.style.cssText = `background:${type === 'error' ? '#ff4444' : '#00c853'};color:#fff;padding:12px 18px;border-radius:8px;font-size:14px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,0.4);opacity:1;transition:opacity 0.4s;`;
+  toast.textContent = msg;
+  container.appendChild(toast);
+  setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 400); }, 4000);
+}
+
+// ── Arb History ───────────────────────────────────────────────────────────
+let arbHistory = [];
+
+async function fetchArbHistory() {
+  try {
+    const res = await fetch(`${API_BASE}/api/arb-history`, fetchOpts);
+    if (res.ok) {
+      arbHistory = await res.json();
+      renderArbHistory();
+    }
+  } catch (_) {}
+}
+
+function renderArbHistory() {
+  const el = document.getElementById('arbHistoryContent');
+  if (!el) return;
+  if (!arbHistory.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:13px">No arbs placed yet.</p>';
+    return;
+  }
+  el.innerHTML = arbHistory.map((h) => {
+    const date = new Date(h.placedAt).toLocaleString();
+    const profit = h.netProfitUsd != null ? `+$${h.netProfitUsd}` : '';
+    return `<div class="dashboard-order-card poly" style="margin-bottom:8px">
+      <div class="order-game">${escapeHtml(h.awayTeam || '')} @ ${escapeHtml(h.homeTeam || '')}</div>
+      <div class="order-detail">${escapeHtml(h.strategyLabel || '')} · Poly $${h.stakePolyUsd} · Kalshi $${h.stakeKalshiUsd}</div>
+      <div class="order-detail" style="color:var(--green)">${profit} expected profit</div>
+      <div class="order-detail" style="color:var(--muted);font-size:11px">${date}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Auto-arb toggle ───────────────────────────────────────────────────────
+function toggleAutoArb() {
+  autoArbEnabled = !autoArbEnabled;
+  const btn = document.getElementById('autoArbBtn');
+  if (btn) {
+    btn.textContent = autoArbEnabled ? '🤖 Auto Arb: ON' : '🤖 Auto Arb: OFF';
+    btn.style.background = autoArbEnabled ? 'var(--green)' : '';
+    btn.style.color = autoArbEnabled ? '#000' : '';
+  }
+  if (autoArbEnabled) {
+    showToast('Auto Arb enabled — opportunities will be placed automatically');
+  } else {
+    autoArbPlaced.clear(); // reset so re-enabling can place again
+    showToast('Auto Arb disabled', 'error');
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────
 
 function kalshiTickerToMatchup(ticker) {
   if (!ticker || typeof ticker !== 'string') return null;
@@ -657,6 +860,75 @@ function kalshiTickerToTeam(ticker) {
   return parts.length >= 3 ? parts[parts.length - 1] : null;
 }
 
+function renderTradeCard(t, accentClass) {
+  const team = t.outcome ? escapeHtml(t.outcome) : (t.side || 'BUY').toUpperCase();
+  const priceCents = t.price != null ? (t.price * 100).toFixed(0) + '¢' : '';
+  const stake = t.stake != null ? '$' + t.stake.toFixed(2) : '';
+  const date = t.created_at ? new Date(t.created_at * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+  const rs = t.result_status || 'pending';
+  const isArb = arbHistory.some((h) =>
+    (h.awayTeam && team.toLowerCase().includes(h.awayTeam.toLowerCase())) ||
+    (h.homeTeam && team.toLowerCase().includes(h.homeTeam.toLowerCase()))
+  );
+  const badge = rs === 'win'
+    ? `<span class="trade-badge win">WIN ✓</span>`
+    : rs === 'loss'
+    ? `<span class="trade-badge loss">LOSS ✗</span>`
+    : `<span class="trade-badge pending">LIVE</span>`;
+  const arbTag = isArb ? `<span class="trade-badge arb">ARB</span>` : '';
+  const profitLine = rs === 'win' && t.payout != null && t.stake != null
+    ? `<div class="trade-profit win">Payout: $${t.payout.toFixed(2)} · Profit: +$${(t.payout - t.stake).toFixed(2)}</div>`
+    : rs === 'loss' && stake
+    ? `<div class="trade-profit loss">Lost: ${stake}</div>`
+    : '';
+  return `<div class="trade-card ${accentClass}">
+    <div class="trade-card-top">
+      <span class="trade-team">🏀 ${team}</span>
+      <div style="display:flex;gap:4px">${arbTag}${badge}</div>
+    </div>
+    <div class="trade-card-mid">
+      <span class="trade-pill ${accentClass}">${(t.side || 'BUY').toUpperCase()}</span>
+      <span class="trade-meta">${t.size != null ? Number(t.size).toFixed(0) + ' shares' : ''} @ ${priceCents}</span>
+      <span class="trade-meta">Stake: ${stake}</span>
+    </div>
+    ${profitLine}
+    <div class="trade-date">${date}</div>
+  </div>`;
+}
+
+function renderKalshiOrderCard(o) {
+  const ticker = o.ticker || o.market_ticker || '';
+  const matchup = kalshiTickerToMatchup(ticker);
+  const team = kalshiTickerToTeam(ticker);
+  const gameStr = matchup ? `${matchup.away} vs ${matchup.home}` : ticker.slice(0, 20) + '…';
+  const betOn = o.side === 'yes' ? (team || 'Yes') : (team ? team + ' no' : 'No');
+  const price = o.yes_price != null ? o.yes_price + '¢' : (o.order?.yes_price != null ? o.order.yes_price + '¢' : '');
+  const count = o.remaining_count ?? o.count ?? o.order?.remaining_count ?? o.order?.count ?? '';
+  const stake = count && price ? '$' + (Number(count) * parseInt(price) / 100).toFixed(2) : '';
+  const isArb = arbHistory.some((h) =>
+    (h.awayTeam && gameStr.toLowerCase().includes(h.awayTeam.toLowerCase())) ||
+    (h.homeTeam && gameStr.toLowerCase().includes(h.homeTeam.toLowerCase()))
+  );
+  const arbTag = isArb ? `<span class="trade-badge arb">ARB</span>` : '';
+  return `<div class="trade-card kalshi">
+    <div class="trade-card-top">
+      <span class="trade-team">🏀 ${escapeHtml(betOn)}</span>
+      <div style="display:flex;gap:4px">${arbTag}<span class="trade-badge pending">RESTING</span></div>
+    </div>
+    <div class="trade-card-mid">
+      <span class="trade-pill kalshi">${o.side === 'yes' ? 'YES' : 'NO'}</span>
+      <span class="trade-meta">${count} contracts @ ${price}</span>
+      ${stake ? `<span class="trade-meta">Stake: ${stake}</span>` : ''}
+    </div>
+    <div class="trade-date">${escapeHtml(gameStr)}</div>
+  </div>`;
+}
+
+function switchOrdersTab(tab) {
+  document.querySelectorAll('.orders-tab').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === tab));
+  document.querySelectorAll('.orders-panel').forEach((panel) => panel.classList.toggle('hidden', !panel.id.endsWith(tab)));
+}
+
 function renderDashboard() {
   const hint = document.getElementById('dashboardHint');
   const content = document.getElementById('dashboardContent');
@@ -667,60 +939,41 @@ function renderDashboard() {
   }
   hint.hidden = true;
   content.hidden = false;
-  const parts = [];
+
+  const polyTrades = myOrders.polymarket?.trades || [];
+  const polyErr = myOrders.polymarket?.error;
+  const kalshiAllOrders = myOrders.kalshi?.orders || [];
+  const kalshiOrders = kalshiAllOrders.filter((o) => {
+    const ticker = o.ticker || o.market_ticker || '';
+    const status = (o.status || '').toLowerCase();
+    return ticker.startsWith('KXNBAGAME-') && (status === 'resting' || status === 'pending' || status === 'open');
+  });
+  const kalshiErr = myOrders.kalshi?.error;
+
+  const tabs = [];
+  const panels = [];
+
   if (authState.polymarket) {
-    const poly = myOrders.polymarket;
-    const orders = poly?.orders || [];
-    const err = poly?.error;
-    parts.push(`
-      <div class="dashboard-section">
-        <h4>Polymarket</h4>
-        ${err ? `<p class="dashboard-order-card poly" style="color:var(--text-muted)">${escapeHtml(err)}</p>` : ''}
-        ${orders.length === 0 && !err ? '<p class="order-detail">No open orders</p>' : ''}
-        ${(orders.slice(0, 20)).map((o) => {
-          const size = o.original_size != null ? Number(o.original_size) : '';
-          const matched = o.size_matched != null ? Number(o.size_matched) : 0;
-          const price = o.price != null ? (Number(o.price) * 100).toFixed(0) + '¢' : '';
-          return `<div class="dashboard-order-card poly">
-            <div class="order-game">Order ${escapeHtml((o.asset_id || o.id || '').slice(0, 12))}…</div>
-            <div class="order-detail">${o.side || 'buy'} ${size} @ ${price} (matched: ${matched})</div>
-            <div class="order-status">${escapeHtml(o.status || '')}</div>
-          </div>`;
-        }).join('')}
-      </div>`);
+    tabs.push(`<button class="orders-tab active" data-tab="poly" onclick="switchOrdersTab('poly')">Polymarket</button>`);
+    panels.push(`<div class="orders-panel" id="orders-panel-poly">
+      ${polyErr ? `<p class="order-detail" style="color:var(--red);padding:4px">${escapeHtml(polyErr)}</p>` : ''}
+      ${polyTrades.length === 0 && !polyErr ? '<p class="order-detail" style="color:var(--text-muted);padding:8px 0">No filled trades yet</p>' : ''}
+      ${polyTrades.map((t) => renderTradeCard(t, 'poly')).join('')}
+    </div>`);
   }
+
   if (authState.kalshi) {
-    const kalshi = myOrders.kalshi;
-    const allOrders = kalshi?.orders || [];
-    const orders = allOrders.filter((o) => {
-      const ticker = o.ticker || o.market_ticker || '';
-      const status = (o.status || '').toLowerCase();
-      return ticker.startsWith('KXNBAGAME-') && (status === 'resting' || status === 'pending' || status === 'open');
-    });
-    const err = kalshi?.error;
-    parts.push(`
-      <div class="dashboard-section">
-        <h4>Kalshi (NBA moneyline only)</h4>
-        ${err ? `<p class="dashboard-order-card kalshi" style="color:var(--text-muted)">${escapeHtml(err)}</p>` : ''}
-        ${orders.length === 0 && !err ? '<p class="order-detail">No NBA game orders</p>' : ''}
-        ${(orders.slice(0, 20)).map((o) => {
-          const ticker = o.ticker || o.market_ticker || '';
-          const matchup = kalshiTickerToMatchup(ticker);
-          const team = kalshiTickerToTeam(ticker);
-          const gameStr = matchup ? `${matchup.away} vs ${matchup.home}` : ticker.slice(0, 24) + '…';
-          const side = o.side === 'yes' ? (team ? team + ' wins' : 'Yes') : (team ? team + ' no' : 'No');
-          const status = o.status || '';
-          const price = o.yes_price != null ? o.yes_price + '¢' : (o.order?.yes_price != null ? o.order.yes_price + '¢' : '');
-          const count = o.remaining_count ?? o.count ?? o.order?.remaining_count ?? o.order?.count ?? '';
-          return `<div class="dashboard-order-card kalshi">
-            <div class="order-game">${escapeHtml(gameStr)}</div>
-            <div class="order-detail">${escapeHtml(side)} · ${count} @ ${price}</div>
-            <div class="order-status">${escapeHtml(status)}</div>
-          </div>`;
-        }).join('')}
-      </div>`);
+    tabs.push(`<button class="orders-tab${!authState.polymarket ? ' active' : ''}" data-tab="kalshi" onclick="switchOrdersTab('kalshi')">Kalshi</button>`);
+    panels.push(`<div class="orders-panel${authState.polymarket ? ' hidden' : ''}" id="orders-panel-kalshi">
+      ${kalshiErr ? `<p class="order-detail" style="color:var(--red);padding:4px">${escapeHtml(kalshiErr)}</p>` : ''}
+      ${kalshiOrders.length === 0 && !kalshiErr ? '<p class="order-detail" style="color:var(--text-muted);padding:8px 0">No open orders</p>' : ''}
+      ${kalshiOrders.slice(0, 20).map((o) => renderKalshiOrderCard(o)).join('')}
+    </div>`);
   }
-  content.innerHTML = parts.join('');
+
+  content.innerHTML = `
+    <div class="orders-tabs">${tabs.join('')}</div>
+    ${panels.join('')}`;
 }
 
 function formatBalance(platform) {
@@ -1133,6 +1386,7 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
     });
   }
   startArbAutoRefresh();
+  fetchArbHistory();
 
   const simStartBtn = document.getElementById('simStartBtn');
   const simStopBtn = document.getElementById('simStopBtn');

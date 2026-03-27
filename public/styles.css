@@ -276,21 +276,98 @@ body {
   border-radius: 8px;
   margin-bottom: 0.5rem;
 }
-.dashboard-order-card .order-game {
-  font-weight: 600;
-  margin-bottom: 0.25rem;
-}
-.dashboard-order-card .order-detail {
-  color: var(--text-muted);
-  font-size: 0.8rem;
-}
 .dashboard-order-card.poly { border-left: 3px solid var(--accent-poly); }
 .dashboard-order-card.kalshi { border-left: 3px solid var(--accent-kalshi); }
-.dashboard-order-card .order-status {
-  font-size: 0.75rem;
-  margin-top: 0.25rem;
+
+/* New trade cards */
+.trade-card {
+  background: var(--surface, #1a1a2e);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 0.9rem;
+  margin-bottom: 0.6rem;
+  border-left: 3px solid var(--accent-poly);
+}
+.trade-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.4rem;
+}
+.trade-team {
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+.trade-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 99px;
+  letter-spacing: 0.03em;
+}
+.trade-badge.win { background: rgba(0,200,100,0.15); color: #00c864; border: 1px solid #00c864; }
+.trade-badge.loss { background: rgba(255,60,60,0.15); color: #ff3c3c; border: 1px solid #ff3c3c; }
+.trade-badge.pending { background: rgba(150,150,150,0.15); color: #999; border: 1px solid #555; }
+.trade-card-mid {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.25rem;
+}
+.trade-pill {
+  font-size: 0.68rem;
+  font-weight: 700;
+  background: var(--accent-poly);
+  color: #fff;
+  padding: 1px 7px;
+  border-radius: 99px;
+}
+.trade-meta {
+  font-size: 0.78rem;
   color: var(--text-muted);
 }
+.trade-profit {
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin-top: 0.2rem;
+}
+.trade-profit.win { color: #00c864; }
+.trade-profit.loss { color: #ff3c3c; }
+.trade-date {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin-top: 0.3rem;
+}
+
+/* Orders tab switcher */
+.orders-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 0.75rem;
+  border-bottom: 2px solid var(--border);
+}
+.orders-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  padding: 6px 14px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.orders-tab[data-tab="poly"].active { color: var(--accent-poly); border-color: var(--accent-poly); }
+.orders-tab[data-tab="kalshi"].active { color: var(--accent-kalshi); border-color: var(--accent-kalshi); }
+.orders-panel.hidden { display: none; }
+
+/* Kalshi accent on trade cards */
+.trade-card.kalshi { border-left-color: var(--accent-kalshi); }
+.trade-pill.kalshi { background: var(--accent-kalshi); }
+.trade-pill.poly { background: var(--accent-poly); }
+.trade-badge.arb { background: rgba(255,180,0,0.15); color: #ffb400; border: 1px solid #ffb400; }
 
 .live-panel {
   margin-bottom: 1rem;
@@ -384,6 +461,61 @@ body {
   border: 1px solid var(--border);
   border-radius: 12px;
 }
+.engine-panel {
+  margin-bottom: 1.25rem;
+  padding: 1rem 1.25rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.engine-config {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.engine-config label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  gap: 3px;
+}
+.engine-config input[type="number"] {
+  width: 90px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+.engine-stats {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-top: 10px;
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+.engine-stats strong { color: var(--green); }
+.engine-feed {
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-family: monospace;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.engine-feed-item { border-bottom: 1px solid var(--border); padding-bottom: 3px; }
+.engine-feed-item.success { color: var(--green); }
+.engine-feed-item.error { color: #ff6b6b; }
 .arb-title {
   font-size: 1rem;
   font-weight: 600;

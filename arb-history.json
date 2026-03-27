@@ -1,0 +1,34 @@
+[
+  {
+    "id": "c4954c39-6e6a-4526-a060-48387e16888f",
+    "placedAt": 1774572464303,
+    "gameKey": "CHI-MEM",
+    "awayTeam": "CHI",
+    "homeTeam": "MEM",
+    "strategyLabel": "Away (CHI) on Poly, Home (MEM) on Kalshi",
+    "stakePolyUsd": 7.61,
+    "stakeKalshiUsd": 3.81,
+    "netProfitUsd": 1.09,
+    "polyPrice": 0.6,
+    "kalshiYesPriceCents": 30,
+    "polyOrderId": "0xc3a8c655c2dd84ce1da6d68d67ffee49766c6215744d66b16cf26b014fe6120f",
+    "kalshiOrderId": "cbbb2a1b-6f71-49e6-ba3f-69385b97366f",
+    "status": "placed"
+  },
+  {
+    "id": "229422b5-47be-47c9-9fe8-821cb3b0b250",
+    "placedAt": 1774572419915,
+    "gameKey": "CHI-MEM",
+    "awayTeam": "CHI",
+    "homeTeam": "MEM",
+    "strategyLabel": "Away (CHI) on Poly, Home (MEM) on Kalshi",
+    "stakePolyUsd": 17.45,
+    "stakeKalshiUsd": 8.44,
+    "netProfitUsd": 2.78,
+    "polyPrice": 0.6,
+    "kalshiYesPriceCents": 29,
+    "polyOrderId": "0x6f3bc6dc36729f7291468d24544f4eced9d54b8d626c1e11cdbc2e542ecfc928",
+    "kalshiOrderId": "2b6b10cf-4c18-4718-a184-46638fa5f459",
+    "status": "placed"
+  }
+]

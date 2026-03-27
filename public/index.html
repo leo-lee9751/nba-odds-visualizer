@@ -109,6 +109,7 @@
         <p class="arb-hint">Find risk-free arbitrage between Polymarket and Kalshi (NBA moneyline). Auto-refreshes every 0.5s. Sign in to both to place.</p>
         <div class="arb-toolbar">
           <button type="button" class="auth-btn auth-btn-outline" id="checkArbBtn">Check arb</button>
+          <button type="button" class="auth-btn auth-btn-outline" id="autoArbBtn" onclick="toggleAutoArb()">🤖 Auto Arb: OFF</button>
           <span class="arb-checking-indicator" id="arbCheckingIndicator" hidden aria-live="polite">
             <span class="arb-checking-dot"></span> Checking…
           </span>
@@ -118,17 +119,31 @@
           <h4 class="arb-past-title">Past arb opportunities</h4>
           <div class="arb-past-content" id="arbPastContent"></div>
         </div>
-      </section>
-      <section class="sim-panel" id="simPanel">
-        <h3 class="sim-title">Arb simulation</h3>
-        <p class="sim-hint">Start with $1000 on each platform; simulate taking every arb that appears (same arb can repeat after 3s).</p>
-        <div class="sim-toolbar">
-          <button type="button" class="auth-btn" id="simStartBtn">Start simulation</button>
-          <button type="button" class="auth-btn auth-btn-outline" id="simStopBtn" disabled>Stop</button>
-          <span class="sim-balances" id="simBalances"></span>
+        <div style="margin-top:24px">
+          <h4 class="arb-past-title" style="margin-bottom:8px">📋 Arb history</h4>
+          <div id="arbHistoryContent" style="color:var(--muted);font-size:13px">Loading…</div>
         </div>
-        <div class="sim-chart-wrap">
-          <canvas id="simChart" width="800" height="280"></canvas>
+      </section>
+      <section class="engine-panel" id="enginePanel">
+        <h3 class="arb-title">⚡ Live Arb Engine</h3>
+        <p class="arb-hint">Places micro-bets automatically every few seconds when arbs exist. Uses Kelly sizing. Must be signed in to both platforms.</p>
+        <div class="engine-config" id="engineConfigForm">
+          <label>Bet size ($)<input type="number" id="engineBetSize" value="2" min="1" max="100" step="1"></label>
+          <label>Interval (ms)<input type="number" id="engineInterval" value="3000" min="500" max="30000" step="500"></label>
+          <label>Cooldown (ms)<input type="number" id="engineCooldown" value="30000" min="1000" step="1000"></label>
+          <label>Kelly fraction<input type="number" id="engineKelly" value="0.25" min="0.05" max="1" step="0.05"></label>
+          <label>Stop if Poly &lt; ($)<input type="number" id="engineCircuitPoly" value="5" min="0" step="1"></label>
+          <label>Stop if Kalshi &lt; ($)<input type="number" id="engineCircuitKal" value="5" min="0" step="1"></label>
+        </div>
+        <div class="arb-toolbar" style="margin-top:12px">
+          <button type="button" class="auth-btn" id="engineStartBtn" onclick="startEngine()">▶ Start Engine</button>
+          <button type="button" class="auth-btn auth-btn-outline" id="engineStopBtn" onclick="stopEngine()" disabled>■ Stop</button>
+          <span id="engineStatusBadge" style="font-size:13px;color:var(--muted);margin-left:8px">Stopped</span>
+        </div>
+        <div class="engine-stats" id="engineStats"></div>
+        <div id="engineFeedWrap" style="margin-top:12px;display:none">
+          <h4 style="font-size:13px;font-weight:600;margin-bottom:6px">Live feed</h4>
+          <div class="engine-feed" id="engineFeed"></div>
         </div>
       </section>
       <div class="games-table-wrapper" id="gamesTableWrapper">
