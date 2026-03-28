@@ -33,6 +33,42 @@ const fetchOptions = {
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
+// Temporary debug: shows raw Kalshi positions + market fetch result
+app.get('/api/debug/kalshi-prices', async (req, res) => {
+  if (!req.session?.kalshiCreds) return res.status(401).json({ error: 'Not signed in to Kalshi' });
+  const creds = req.session.kalshiCreds;
+  const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
+  const result = { positions: [], marketFetch: [] };
+
+  // 1. Fetch positions
+  try {
+    const posPath = '/trade-api/v2/portfolio/positions';
+    const ts = String(Date.now());
+    const sig = kalshiSign(creds.privateKey, ts, 'GET', posPath);
+    const posRes = await fetch(`${baseUrl}${posPath}?limit=50`, { headers: { 'KALSHI-ACCESS-KEY': creds.apiKeyId, 'KALSHI-ACCESS-TIMESTAMP': ts, 'KALSHI-ACCESS-SIGNATURE': sig } });
+    const posData = await posRes.json().catch(() => ({}));
+    const allPos = posData.market_positions || posData.positions || [];
+    result.positions = allPos.filter(p => (p.ticker||'').startsWith('KXNBAGAME-')).map(p => ({ ...p })); // full object
+  } catch (e) { result.posError = e.message; }
+
+  // 2. Try fetching each ticker's market
+  for (const pos of result.positions.slice(0, 5)) {
+    const ticker = pos.ticker;
+    try {
+      const mktPath = `/trade-api/v2/markets/${ticker}`;
+      const ts = String(Date.now());
+      const sig = kalshiSign(creds.privateKey, ts, 'GET', mktPath);
+      const mktRes = await fetch(`${baseUrl}${mktPath}`, { headers: { 'KALSHI-ACCESS-KEY': creds.apiKeyId, 'KALSHI-ACCESS-TIMESTAMP': ts, 'KALSHI-ACCESS-SIGNATURE': sig, 'Content-Type': 'application/json' } });
+      const status = mktRes.status;
+      const body = await mktRes.json().catch(() => ({}));
+      // Return the FULL market object so we can see all available field names
+      result.marketFetch.push({ ticker, httpStatus: status, fullMarket: body.market || body, error: body.error });
+    } catch (e) { result.marketFetch.push({ ticker, error: e.message }); }
+  }
+
+  res.json(result);
+});
+
 // ── Arb History (persisted to arb-history.json) ────────────────────────────
 const ARB_HISTORY_FILE = path.join(__dirname, 'arb-history.json');
 function readArbHistory() {
@@ -791,27 +827,135 @@ const ARB_RESERVE_POLY_USD = Number(process.env.ARB_RESERVE_POLY_USD) || 0;
 const ARB_RESERVE_KAL_USD = Number(process.env.ARB_RESERVE_KAL_USD) || 0;
 const KALSHI_TAKER_FEE = 0.07; // 0.07 * C * P * (1-P) per contract
 
+// ── Value Betting Engine: Sharp Odds ─────────────────────────────────────────
+const ODDS_API_KEY = process.env.ODDS_API_KEY || '';
+const ODDS_API_BASE = 'https://api.the-odds-api.com/v4/sports/basketball_nba/odds/';
+const ODDS_API_BOOKMAKERS = 'draftkings,fanduel,betmgm';
+const SHARP_CACHE_TTL_MS = 300_000; // 5 min cache to conserve API quota
+const VALUE_MIN_EDGE = Number(process.env.VALUE_MIN_EDGE) || 0.03;
+const VALUE_MAX_POSITION_USD = Number(process.env.VALUE_MAX_POSITION_USD) || 20;
+const VALUE_ORDER_SIZE_USD = Number(process.env.VALUE_ORDER_SIZE_USD) || 2;
+
+let sharpOddsCache = null;
+let sharpOddsFetchInFlight = false;
+
+function americanToProb(americanOdds) {
+  const o = Number(americanOdds);
+  if (!Number.isFinite(o)) return null;
+  return o > 0 ? 100 / (o + 100) : Math.abs(o) / (Math.abs(o) + 100);
+}
+
+const ODDS_API_TEAM_MAP = {
+  'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BKN',
+  'Charlotte Hornets': 'CHA', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE',
+  'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET',
+  'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND',
+  'LA Clippers': 'LAC', 'Los Angeles Lakers': 'LAL', 'Memphis Grizzlies': 'MEM',
+  'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL', 'Minnesota Timberwolves': 'MIN',
+  'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK', 'Oklahoma City Thunder': 'OKC',
+  'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI', 'Phoenix Suns': 'PHX',
+  'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC', 'San Antonio Spurs': 'SAS',
+  'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA', 'Washington Wizards': 'WAS',
+};
+
+async function fetchSharpOdds() {
+  if (sharpOddsFetchInFlight) return sharpOddsCache?.games || new Map();
+  if (sharpOddsCache && Date.now() - sharpOddsCache.fetchedAt < SHARP_CACHE_TTL_MS) {
+    return sharpOddsCache.games;
+  }
+  if (!ODDS_API_KEY) {
+    console.warn('[ValueEngine] ODDS_API_KEY not set');
+    return new Map();
+  }
+  sharpOddsFetchInFlight = true;
+  try {
+    const url = `${ODDS_API_BASE}?apiKey=${encodeURIComponent(ODDS_API_KEY)}&regions=us&markets=h2h&bookmakers=${ODDS_API_BOOKMAKERS}&oddsFormat=american`;
+    const res = await fetch(url, fetchOptions);
+    if (!res.ok) {
+      console.warn(`[ValueEngine] Odds API ${res.status}`);
+      return sharpOddsCache?.games || new Map();
+    }
+    const events = await res.json();
+    const games = new Map();
+    for (const event of events) {
+      const away = ODDS_API_TEAM_MAP[event.away_team] || event.away_team?.slice(0,3).toUpperCase();
+      const home = ODDS_API_TEAM_MAP[event.home_team] || event.home_team?.slice(0,3).toUpperCase();
+      if (!away || !home) continue;
+      const probSums = { away: 0, home: 0 };
+      let count = 0;
+      for (const bm of event.bookmakers || []) {
+        const h2h = (bm.markets || []).find((m) => m.key === 'h2h');
+        if (!h2h) continue;
+        const awayOut = h2h.outcomes?.find((o) => ODDS_API_TEAM_MAP[o.name] === away || o.name === event.away_team);
+        const homeOut = h2h.outcomes?.find((o) => ODDS_API_TEAM_MAP[o.name] === home || o.name === event.home_team);
+        if (!awayOut || !homeOut) continue;
+        const ap = americanToProb(awayOut.price);
+        const hp = americanToProb(homeOut.price);
+        if (ap == null || hp == null) continue;
+        const total = ap + hp;
+        probSums.away += ap / total;
+        probSums.home += hp / total;
+        count++;
+      }
+      if (!count) continue;
+      games.set(gameKey(away, home), {
+        away: Math.round((probSums.away / count) * 1000) / 1000,
+        home: Math.round((probSums.home / count) * 1000) / 1000,
+        bookmakerCount: count, awayTeam: away, homeTeam: home,
+      });
+    }
+    sharpOddsCache = { fetchedAt: Date.now(), games };
+    console.log(`[ValueEngine] Sharp odds fetched for ${games.size} games`);
+    return games;
+  } catch (err) {
+    console.error('[ValueEngine] fetchSharpOdds error:', err.message);
+    return sharpOddsCache?.games || new Map();
+  } finally { sharpOddsFetchInFlight = false; }
+}
+
+function detectValueOpportunities(polyGames, sharpOddsMap, minEdge = VALUE_MIN_EDGE) {
+  const opportunities = [];
+  for (const poly of polyGames) {
+    const key = gameKey(poly.awayTeam, poly.homeTeam);
+    const sharp = sharpOddsMap.get(key);
+    if (!sharp) continue;
+    for (const [side, tokenId, polyOddsField, sharpField, label] of [
+      ['away', poly.tokenIdAway, poly.awayOdds, sharp.away, `${poly.awayTeam}`],
+      ['home', poly.tokenIdHome, poly.homeOdds, sharp.home, `${poly.homeTeam}`],
+    ]) {
+      if (!tokenId) continue;
+      const polyProb = Math.max(0.01, Math.min(0.99, Number(polyOddsField) || 0.5));
+      const sharpProb = sharpField;
+      const edge = sharpProb - polyProb;
+      if (edge < minEdge) continue;
+      opportunities.push({
+        gameKey: key, awayTeam: poly.awayTeam, homeTeam: poly.homeTeam,
+        side, label, polyProb, sharpProb,
+        edge: Math.round(edge * 1000) / 1000,
+        edgePct: Math.round(edge * 10000) / 100,
+        polyTokenId: tokenId,
+        polyTickSize: poly.tickSize || '0.01',
+        polyNegRisk: Boolean(poly.negRisk),
+        bookmakerCount: sharp.bookmakerCount,
+      });
+    }
+  }
+  return opportunities.sort((a, b) => b.edge - a.edge);
+}
+
 // ── Live Arb Engine ──────────────────────────────────────────────────────────
 const arbEngine = {
-  running: false,
-  startedAt: null,
+  running: false, startedAt: null,
   config: {
-    betSizeUsd: 2,
-    intervalMs: 3000,
-    cooldownMs: 30000,
-    circuitBreakerPolyUsd: 5,
-    circuitBreakerKalUsd: 5,
-    maxBetsPerOpportunity: 10,
-    kellyFraction: 0.25,
-    priceImpactBpsPerDollar: 0.5,
+    orderSizeUsd: 2, intervalMs: 5000, cooldownMs: 60000,
+    maxPositionUsd: 20, circuitBreakerPolyUsd: 5, minEdge: 0.03,
   },
-  stats: { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, expectedProfitUsd: 0 },
-  cooldowns: new Map(),      // `${gameKey}-${strategy}` → timestamp of last bet
-  marketImpact: new Map(),   // polyTokenId → { betsPlaced, estimatedPriceMove }
+  stats: { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, totalEdgeCapture: 0 },
+  positionMap: new Map(),
+  cooldowns: new Map(),
   sseClients: new Set(),
   timerId: null,
   credsPoly: null,
-  credsKal: null,
   polyFunder: null,
 };
 
@@ -844,27 +988,21 @@ function computeKellyBetSize(opp, cfg, availPoly, availKal) {
   return { stakePolyUsd, stakeKalshiUsd, adjustedPolyPrice };
 }
 
-async function runEngineIteration() {
+async function runValueEngineIteration() {
   if (!arbEngine.running) return;
-  const { credsPoly, credsKal, polyFunder, config: cfg } = arbEngine;
-  if (!credsPoly || !credsKal) { stopArbEngine('Missing credentials'); return; }
-
+  const { credsPoly, polyFunder, config: cfg } = arbEngine;
+  if (!credsPoly) { stopArbEngine('Missing Polymarket credentials'); return; }
   try {
-    // Fetch odds + balances in parallel
-    const [polyRes, kalRes] = await Promise.allSettled([
-      fetch('http://localhost:3000/api/polymarket'),
-      fetch('http://localhost:3000/api/kalshi'),
+    const base = 'http://localhost:' + (process.env.PORT || 3000);
+    const [polyRes, sharpGames] = await Promise.allSettled([
+      fetch(`${base}/api/polymarket`),
+      fetchSharpOdds(),
     ]);
-
     const polyData = polyRes.status === 'fulfilled' ? await polyRes.value.json().catch(() => ({})) : {};
-    const kalData = kalRes.status === 'fulfilled' ? await kalRes.value.json().catch(() => ({})) : {};
-
+    const sharpMap = sharpGames.status === 'fulfilled' ? sharpGames.value : new Map();
     const polyGames = polyData.games || [];
-    const kalshiGames = kalData.games || [];
 
-    // Fetch real balances directly using stored credentials (no session cookie needed)
-    let polyBal = cfg.betSizeUsd * 5;
-    let kalBal = cfg.betSizeUsd * 5;
+    let polyBal = cfg.orderSizeUsd * 5;
     try {
       const { ClobClient, AssetType } = await import('@polymarket/clob-client');
       const { Wallet } = await import('ethers');
@@ -876,101 +1014,62 @@ async function runEngineIteration() {
       const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
       polyBal = Number(BigInt(bal?.balance ?? 0)) / 1e6;
     } catch (_) {}
-    try {
-      const path = '/trade-api/v2/portfolio/balance';
-      const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
-      const timestamp = String(Date.now());
-      const sig = kalshiSign(credsKal.privateKey, timestamp, 'GET', path);
-      const r = await fetch(`${baseUrl}${path}`, {
-        headers: { 'KALSHI-ACCESS-KEY': credsKal.apiKeyId, 'KALSHI-ACCESS-TIMESTAMP': timestamp, 'KALSHI-ACCESS-SIGNATURE': sig },
-      });
-      if (r.ok) { const d = await r.json(); kalBal = (d?.balance?.available ?? 0) / 100; }
-    } catch (_) {}
 
-    // Circuit breaker
-    if (polyBal < cfg.circuitBreakerPolyUsd || kalBal < cfg.circuitBreakerKalUsd) {
-      stopArbEngine(`Circuit breaker: Poly $${polyBal.toFixed(2)}, Kalshi $${kalBal.toFixed(2)}`);
+    if (polyBal < cfg.circuitBreakerPolyUsd) {
+      stopArbEngine(`Circuit breaker: Poly $${polyBal.toFixed(2)}`);
       return;
     }
 
-    const opportunities = detectArbOpportunities(polyGames, kalshiGames, { polymarket: { balanceUsdc: polyBal }, kalshi: { balanceCents: kalBal * 100 } });
-    broadcastEngineEvent('tick', { opportunityCount: opportunities.length, stats: arbEngine.stats, polyBal, kalBal });
+    const opportunities = detectValueOpportunities(polyGames, sharpMap, cfg.minEdge);
+    broadcastEngineEvent('tick', { opportunityCount: opportunities.length, stats: arbEngine.stats, polyBal });
 
     const now = Date.now();
     for (const opp of opportunities) {
-      const cooldownKey = `${opp.gameKey}-${opp.strategy}`;
-      const lastBet = arbEngine.cooldowns.get(cooldownKey) || 0;
-      if (now - lastBet < cfg.cooldownMs) continue;
-
-      const impact = arbEngine.marketImpact.get(opp.polyTokenId) || { betsPlaced: 0, estimatedPriceMove: 0 };
-      if (impact.betsPlaced >= cfg.maxBetsPerOpportunity) continue;
-
-      const sizing = computeKellyBetSize(opp, cfg, polyBal, kalBal);
-      if (!sizing) continue;
-
+      const posKey = `${opp.gameKey}-${opp.side}`;
+      const positionSoFar = arbEngine.positionMap.get(posKey) || 0;
+      if (positionSoFar >= cfg.maxPositionUsd) continue;
+      const lastOrder = arbEngine.cooldowns.get(posKey) || 0;
+      if (now - lastOrder < cfg.cooldownMs) continue;
+      const orderUsd = Math.min(cfg.orderSizeUsd, cfg.maxPositionUsd - positionSoFar, polyBal - cfg.circuitBreakerPolyUsd);
+      if (orderUsd < 1) continue;
+      const price = opp.polyProb;
+      const shareCount = Math.max(1, Math.floor(orderUsd / Math.max(0.01, price)));
       arbEngine.stats.betsAttempted++;
-      arbEngine.cooldowns.set(cooldownKey, now);
-
+      arbEngine.cooldowns.set(posKey, now);
       const betId = crypto.randomUUID();
-      const polySize = Math.max(1, Math.floor(sizing.stakePolyUsd / Math.max(0.01, sizing.adjustedPolyPrice)));
-      const kalCount = Math.max(1, Math.floor((sizing.stakeKalshiUsd * 100) / Math.max(1, opp.kalshiYesPriceCents)));
-
-      broadcastEngineEvent('bet_attempting', {
-        betId, gameKey: opp.gameKey, strategyLabel: opp.strategyLabel,
-        stakePolyUsd: sizing.stakePolyUsd, stakeKalshiUsd: sizing.stakeKalshiUsd,
-        polyPrice: sizing.adjustedPolyPrice, kalshiPrice: opp.kalshiPrice,
+      broadcastEngineEvent('bet_attempting', { betId, gameKey: opp.gameKey, label: opp.label, orderUsd, price, edge: opp.edgePct });
+      const result = await placePolyOrderDirect(credsPoly, polyFunder, {
+        tokenId: opp.polyTokenId, side: 'BUY', price, size: shareCount,
+        tickSize: opp.polyTickSize || '0.01', negRisk: opp.polyNegRisk || false,
       });
-
-      // Place both legs concurrently
-      const [polySettled, kalSettled] = await Promise.allSettled([
-        placePolyOrderDirect(credsPoly, polyFunder, {
-          tokenId: opp.polyTokenId, side: 'BUY',
-          price: sizing.adjustedPolyPrice, size: polySize,
-          tickSize: opp.polyTickSize || '0.01', negRisk: opp.polyNegRisk || false,
-        }),
-        placeKalshiOrderDirect(credsKal, {
-          ticker: opp.kalshiTicker, side: opp.kalshiSide || 'yes',
-          count: kalCount, yes_price: opp.kalshiYesPriceCents || 50,
-          client_order_id: betId,
-        }),
-      ]);
-
-      const polyOk = polySettled.status === 'fulfilled' && !polySettled.value?.error;
-      const kalOk = kalSettled.status === 'fulfilled' && !kalSettled.value?.error;
-      const polyErr = polySettled.status === 'rejected' ? polySettled.reason?.message : polySettled.value?.error;
-      const kalErr = kalSettled.status === 'rejected' ? kalSettled.reason?.message : kalSettled.value?.error;
-
-      if (polyOk && kalOk) {
-        arbEngine.stats.betsPlaced++;
-        arbEngine.stats.totalStakedUsd += sizing.stakePolyUsd + sizing.stakeKalshiUsd;
-        arbEngine.stats.expectedProfitUsd += opp.netProfitUsd || 0;
-        // Update market impact
-        const prev = arbEngine.marketImpact.get(opp.polyTokenId) || { betsPlaced: 0, estimatedPriceMove: 0 };
-        arbEngine.marketImpact.set(opp.polyTokenId, {
-          betsPlaced: prev.betsPlaced + 1,
-          estimatedPriceMove: prev.estimatedPriceMove + (sizing.stakePolyUsd * cfg.priceImpactBpsPerDollar / 10000),
-        });
-        appendArbHistory({
-          id: betId, placedAt: Date.now(), source: 'engine',
-          gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
-          strategyLabel: opp.strategyLabel,
-          stakePolyUsd: sizing.stakePolyUsd, stakeKalshiUsd: sizing.stakeKalshiUsd,
-          netProfitUsd: opp.netProfitUsd, polyPrice: sizing.adjustedPolyPrice,
-          kalshiYesPriceCents: opp.kalshiYesPriceCents, status: 'placed',
-        });
-        broadcastEngineEvent('bet_placed', {
-          betId, gameKey: opp.gameKey, strategyLabel: opp.strategyLabel,
-          stakePolyUsd: sizing.stakePolyUsd, stakeKalshiUsd: sizing.stakeKalshiUsd,
-          netProfitUsd: opp.netProfitUsd, stats: arbEngine.stats,
-        });
-        console.log(`[ArbEngine] ✓ bet placed: ${opp.strategyLabel} stake $${sizing.stakePolyUsd.toFixed(2)}+$${sizing.stakeKalshiUsd.toFixed(2)} profit ~$${(opp.netProfitUsd||0).toFixed(2)}`);
-      } else {
-        broadcastEngineEvent('bet_failed', { betId, gameKey: opp.gameKey, polyErr, kalErr });
-        console.log(`[ArbEngine] ✗ bet failed: ${opp.strategyLabel} polyErr=${polyErr} kalErr=${kalErr}`);
+      if (result?.error) {
+        console.log(`[ValueEngine] ✗ ${result.error}`);
+        broadcastEngineEvent('bet_failed', { betId, gameKey: opp.gameKey, error: result.error });
+        continue;
       }
+      const stakeActual = shareCount * price;
+      arbEngine.stats.betsPlaced++;
+      arbEngine.stats.totalStakedUsd += stakeActual;
+      arbEngine.stats.totalEdgeCapture += opp.edge * stakeActual;
+      arbEngine.positionMap.set(posKey, positionSoFar + stakeActual);
+      appendArbHistory({
+        id: betId, placedAt: Date.now(), gameKey: opp.gameKey,
+        awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+        strategyLabel: `Value: ${opp.label} +${opp.edgePct}% edge`,
+        stakePolyUsd: Math.round(stakeActual * 100) / 100,
+        stakeKalshiUsd: 0, netProfitUsd: Math.round(opp.edge * stakeActual * 100) / 100,
+        type: 'value',
+      });
+      broadcastEngineEvent('bet_placed', {
+        betId, gameKey: opp.gameKey, label: opp.label,
+        stakeUsd: Math.round(stakeActual * 100) / 100,
+        edge: opp.edgePct, positionTotal: arbEngine.positionMap.get(posKey),
+        stats: arbEngine.stats,
+      });
+      console.log(`[ValueEngine] ✓ ${opp.label} $${stakeActual.toFixed(2)} @ ${(price*100).toFixed(0)}¢ edge=${opp.edgePct}%`);
     }
   } catch (err) {
-    console.error('[ArbEngine] iteration error:', err.message);
+    console.error('[ValueEngine] error:', err.message);
     broadcastEngineEvent('error', { message: err.message });
   }
 }
@@ -994,6 +1093,7 @@ async function placePolyOrderDirect(creds, funder, { tokenId, side, price, size,
   for (const { sigType, funderAddr } of attempts) {
     const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funderAddr);
     try { await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL }); } catch (_) {}
+    try { await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL }); } catch (_) {}
     let ts = tickSize || '0.01';
     try { const mt = await client.getTickSize(tokenIdStr); if (mt != null) ts = polyTickSizeSupported(String(mt)); } catch (_) {}
     userOrder.price = roundPriceToTick(price, ts);
@@ -1041,6 +1141,26 @@ async function placeKalshiOrderDirect(creds, { ticker, side, count, yes_price, c
   if (!res.ok) return { error: data.error || data.message || res.statusText };
   return data;
 }
+async function cancelKalshiOrder(creds, orderId) {
+  const path = `/trade-api/v2/portfolio/orders/${orderId}`;
+  const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
+  const timestamp = String(Date.now());
+  const signature = kalshiSign(creds.privateKey, timestamp, 'DELETE', path);
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: 'DELETE',
+    headers: {
+      'KALSHI-ACCESS-KEY': creds.apiKeyId,
+      'KALSHI-ACCESS-TIMESTAMP': timestamp,
+      'KALSHI-ACCESS-SIGNATURE': signature,
+    },
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || data.message || res.statusText);
+  }
+  return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 function gameKey(away, home) {
@@ -1051,8 +1171,11 @@ function detectArbOpportunities(polyGames, kalshiGames, balances) {
   const opportunities = [];
   const byKey = new Map();
   for (const g of kalshiGames) byKey.set(gameKey(g.awayTeam, g.homeTeam), g);
-  const availPoly = balances?.polymarket?.balanceUsdc != null ? Math.max(1, balances.polymarket.balanceUsdc - ARB_RESERVE_POLY_USD) : ARB_MAX_STAKE_USD;
-  const availKal = balances?.kalshi?.balanceCents != null ? Math.max(1, (balances.kalshi.balanceCents / 100) - ARB_RESERVE_KAL_USD) : ARB_MAX_STAKE_USD;
+  // Subtract active orders from available balance so we don't over-commit
+  const activePolyReserved = balances?.polymarket?.activeOrdersUsdc || 0;
+  const activeKalReserved = balances?.kalshi?.activeOrdersUsdc || 0;
+  const availPoly = balances?.polymarket?.balanceUsdc != null ? Math.max(1, balances.polymarket.balanceUsdc - ARB_RESERVE_POLY_USD - activePolyReserved) : ARB_MAX_STAKE_USD;
+  const availKal = balances?.kalshi?.balanceCents != null ? Math.max(1, (balances.kalshi.balanceCents / 100) - ARB_RESERVE_KAL_USD - activeKalReserved) : ARB_MAX_STAKE_USD;
 
   for (const poly of polyGames) {
     const key = gameKey(poly.awayTeam, poly.homeTeam);
@@ -1457,10 +1580,17 @@ app.get('/api/my-orders', async (req, res) => {
         status: o.status,
         created_at: o.created_at,
       }));
-      // Also fetch recent filled trades + current prices for win/loss detection
+      // Also fetch recent filled trades (maker + taker) + current prices for win/loss detection
       try {
-        const trades = await client.getTrades({ maker_address: funder || wallet.address });
-        const tradeList = Array.isArray(trades) ? trades.slice(0, 20) : [];
+        const addr = funder || wallet.address;
+        const [makerRes2, takerRes2] = await Promise.allSettled([
+          client.getTrades({ maker_address: addr }),
+          client.getTrades({ taker_address: addr }),
+        ]);
+        const ml = makerRes2.status === 'fulfilled' && Array.isArray(makerRes2.value) ? makerRes2.value : [];
+        const tl = takerRes2.status === 'fulfilled' && Array.isArray(takerRes2.value) ? takerRes2.value : [];
+        const tm = new Map([...ml, ...tl].map((t) => [t.id, t]));
+        const tradeList = [...tm.values()].slice(0, 50);
         // Fetch current midpoint prices to determine win/loss
         let priceMap = {};
         try {
@@ -1631,6 +1761,126 @@ function roundPriceToTick(price, tickSizeStr) {
   const decimals = tick >= 0.1 ? 1 : tick >= 0.01 ? 2 : tick >= 0.001 ? 3 : 4;
   return Math.round(p * Math.pow(10, decimals)) / Math.pow(10, decimals);
 }
+
+// Cancel a Kalshi order
+app.post('/api/kalshi/cancel-order', async (req, res) => {
+  const kal = req.session?.kalshiCreds;
+  if (!kal) return res.status(401).json({ error: 'Not signed in to Kalshi' });
+  const { order_id } = req.body || {};
+  if (!order_id) return res.status(400).json({ error: 'Missing order_id' });
+  try {
+    await cancelKalshiOrder(kal, order_id);
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Cancel an open Polymarket order by order ID
+app.post('/api/polymarket/cancel-order', async (req, res) => {
+  const poly = await getPolyWalletAndFunder(req);
+  if (!poly) return res.status(401).json({ error: 'Not signed in to Polymarket' });
+  const { order_id } = req.body || {};
+  if (!order_id) return res.status(400).json({ error: 'Missing order_id' });
+  console.log('Cancelling Poly order ID:', order_id);
+  try {
+    const { ClobClient } = await import('@polymarket/clob-client');
+    const { Wallet } = await import('ethers');
+    const { wallet, apiCreds } = poly;
+    // Try all sig types until one works
+    const attempts = [0, 1, 2];
+    let lastErr = null;
+    for (const sigType of attempts) {
+      try {
+        const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, wallet.address);
+        // Try both formats: string ID and object {orderID}
+        let result;
+        try {
+          result = await client.cancelOrder({ orderID: order_id });
+        } catch (_) {
+          result = await client.cancelOrder(order_id);
+        }
+        console.log('Cancel order result:', JSON.stringify(result));
+        if (result?.error || result?.errorMsg) {
+          lastErr = new Error(result.error || result.errorMsg);
+          continue;
+        }
+        // cancelOrder returns {canceled: [...], not_canceled: {...}}
+        const cancelled = result?.canceled || [];
+        const success = Array.isArray(cancelled) && cancelled.includes(order_id);
+        if (!success && !cancelled.length) {
+          lastErr = new Error('Order not found or already cancelled');
+          continue;
+        }
+        return res.json({ success: true, result });
+      } catch (e) {
+        lastErr = e;
+        if (/invalid signature/i.test(e.message)) continue;
+        break;
+      }
+    }
+    return res.status(500).json({ error: lastErr?.message || 'Cancel failed' });
+  } catch (err) {
+    console.error('Cancel order error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Sell a Polymarket position at market price (best bid)
+app.post('/api/polymarket/sell-position', async (req, res) => {
+  const poly = await getPolyWalletAndFunder(req);
+  if (!poly) return res.status(401).json({ error: 'Not signed in to Polymarket' });
+  const { asset_id, size } = req.body || {};
+  if (!asset_id || !size) return res.status(400).json({ error: 'Missing asset_id or size' });
+  try {
+    const { ClobClient, Side, OrderType } = await import('@polymarket/clob-client');
+    const { wallet, apiCreds, funder } = poly;
+    // Get current best bid from orderbook
+    let sellPrice = 0.01;
+    try {
+      const obRes = await fetch(`https://clob.polymarket.com/book?token_id=${encodeURIComponent(asset_id)}`, fetchOptions);
+      const ob = await obRes.json();
+      const bids = ob?.bids || [];
+      if (bids.length > 0) {
+        // best bid is highest bid price
+        const bestBid = Math.max(...bids.map((b) => parseFloat(b.price) || 0));
+        sellPrice = bestBid > 0 ? bestBid : 0.01;
+      }
+    } catch (_) {}
+    const isProxy = funder !== wallet.address.toLowerCase();
+    const attempts = [
+      { sigType: 0, funderAddr: wallet.address },
+      ...(isProxy ? [{ sigType: 1, funderAddr: funder }] : [{ sigType: 1, funderAddr: wallet.address }]),
+    ];
+    const tokenIdStr = String(asset_id).trim();
+    let lastErr = null;
+    for (const { sigType, funderAddr } of attempts) {
+      try {
+        const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funderAddr);
+        let ts = '0.01';
+        try { const mt = await client.getTickSize(tokenIdStr); if (mt != null) ts = polyTickSizeSupported(String(mt)); } catch (_) {}
+        const priceRounded = roundPriceToTick(sellPrice, ts);
+        const userOrder = { tokenID: tokenIdStr, price: priceRounded, size: Number(size), side: Side.SELL };
+        const response = await client.createAndPostOrder(userOrder, { negRisk: false, tickSize: ts }, OrderType.GTC);
+        const responseErr = response?.error || response?.errorMsg;
+        if (responseErr) {
+          lastErr = new Error(String(responseErr));
+          if (/invalid signature/i.test(String(responseErr))) continue;
+          return res.status(400).json({ error: String(responseErr) });
+        }
+        console.log('SELL RESPONSE:', JSON.stringify(response, null, 2));
+        return res.json({ success: true, sellPrice: priceRounded, response });
+      } catch (e) {
+        lastErr = e;
+        if (/invalid signature/i.test(e.message || '')) continue;
+        return res.status(500).json({ error: e.message });
+      }
+    }
+    return res.status(500).json({ error: lastErr?.message || 'Sell failed' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 // Place order on Polymarket (requires session polyCreds). Uses proxy as funder when email/Magic sign-in.
 app.post('/api/polymarket/order', async (req, res) => {
@@ -1896,31 +2146,49 @@ app.get('/api/arb/engine/stream', (req, res) => {
   req.on('close', () => arbEngine.sseClients.delete(res));
 });
 
+app.get('/api/value/opportunities', async (req, res) => {
+  try {
+    const base = `${req.protocol}://${req.get('host')}`;
+    const cookie = req.headers.cookie || '';
+    const [polyRes, sharpGames] = await Promise.all([
+      fetch(`${base}/api/polymarket`, { headers: { cookie } }),
+      fetchSharpOdds(),
+    ]);
+    const polyData = await polyRes.json().catch(() => ({ games: [] }));
+    const opportunities = detectValueOpportunities(polyData.games || [], sharpGames);
+    res.json({
+      opportunities,
+      sharpCacheAge: sharpOddsCache ? Math.round((Date.now() - sharpOddsCache.fetchedAt) / 1000) : null,
+      config: { minEdge: VALUE_MIN_EDGE, maxPositionUsd: VALUE_MAX_POSITION_USD, orderSizeUsd: VALUE_ORDER_SIZE_USD },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, opportunities: [] });
+  }
+});
+
 app.post('/api/arb/engine/start', (req, res) => {
-  if (!req.session?.polyCreds || !req.session?.kalshiCreds) {
-    return res.status(401).json({ error: 'Sign in to both Polymarket and Kalshi first' });
+  if (!req.session?.polyCreds) {
+    return res.status(401).json({ error: 'Sign in to Polymarket first' });
   }
   if (arbEngine.running) return res.json({ ok: true, message: 'Engine already running' });
   const cfg = req.body?.config || {};
-  if (cfg.betSizeUsd != null) arbEngine.config.betSizeUsd = Number(cfg.betSizeUsd);
+  if (cfg.orderSizeUsd != null) arbEngine.config.orderSizeUsd = Number(cfg.orderSizeUsd);
   if (cfg.intervalMs != null) arbEngine.config.intervalMs = Number(cfg.intervalMs);
   if (cfg.cooldownMs != null) arbEngine.config.cooldownMs = Number(cfg.cooldownMs);
-  if (cfg.kellyFraction != null) arbEngine.config.kellyFraction = Number(cfg.kellyFraction);
+  if (cfg.maxPositionUsd != null) arbEngine.config.maxPositionUsd = Number(cfg.maxPositionUsd);
+  if (cfg.minEdge != null) arbEngine.config.minEdge = Number(cfg.minEdge);
   if (cfg.circuitBreakerPolyUsd != null) arbEngine.config.circuitBreakerPolyUsd = Number(cfg.circuitBreakerPolyUsd);
-  if (cfg.circuitBreakerKalUsd != null) arbEngine.config.circuitBreakerKalUsd = Number(cfg.circuitBreakerKalUsd);
-  if (cfg.maxBetsPerOpportunity != null) arbEngine.config.maxBetsPerOpportunity = Number(cfg.maxBetsPerOpportunity);
   arbEngine.credsPoly = req.session.polyCreds;
-  arbEngine.credsKal = req.session.kalshiCreds;
   arbEngine.polyFunder = req.session.polyFunder || null;
   arbEngine._sessionId = req.sessionID;
-  arbEngine.stats = { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, expectedProfitUsd: 0 };
+  arbEngine.stats = { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, totalEdgeCapture: 0 };
   arbEngine.cooldowns.clear();
-  arbEngine.marketImpact.clear();
+  arbEngine.positionMap.clear();
   arbEngine.running = true;
   arbEngine.startedAt = Date.now();
-  arbEngine.timerId = setInterval(runEngineIteration, arbEngine.config.intervalMs);
+  arbEngine.timerId = setInterval(runValueEngineIteration, arbEngine.config.intervalMs);
   broadcastEngineEvent('started', { config: arbEngine.config });
-  console.log('[ArbEngine] started — betSize $' + arbEngine.config.betSizeUsd + ', interval ' + arbEngine.config.intervalMs + 'ms');
+  console.log('[ValueEngine] started — orderSize $' + arbEngine.config.orderSizeUsd + ', interval ' + arbEngine.config.intervalMs + 'ms');
   res.json({ ok: true, config: arbEngine.config });
 });
 
@@ -1929,6 +2197,431 @@ app.post('/api/arb/engine/stop', (req, res) => {
   res.json({ ok: true, stats: arbEngine.stats });
 });
 
+// ── Real-time P&L tracker ─────────────────────────────────────────────────────
+// GET /api/pnl
+// Returns per-arb P&L: current value of each leg vs original stake, unrealized P&L, best-exit hint.
+app.get('/api/pnl', async (req, res) => {
+  if (!req.session?.polyCreds && !req.session?.kalshiCreds) {
+    return res.status(401).json({ error: 'Not signed in' });
+  }
+
+  const arbHistoryItems = readArbHistory();
+  if (!arbHistoryItems.length) return res.json({ positions: [] });
+
+  // 1. Fetch Polymarket trades (both as maker AND taker — limit orders fill as maker, market orders as taker)
+  let polyTrades = [];
+  const poly = await getPolyWalletAndFunder(req);
+  if (poly) {
+    try {
+      const { ClobClient } = await import('@polymarket/clob-client');
+      const { wallet, apiCreds, funder } = poly;
+      const addr = funder || wallet.address;
+      const isProxy = funder !== wallet.address.toLowerCase();
+      const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, isProxy ? 1 : 0, funder);
+      const [makerRes, takerRes] = await Promise.allSettled([
+        client.getTrades({ maker_address: addr }),
+        client.getTrades({ taker_address: addr }),
+      ]);
+      const makerList = makerRes.status === 'fulfilled' && Array.isArray(makerRes.value) ? makerRes.value : [];
+      const takerList = takerRes.status === 'fulfilled' && Array.isArray(takerRes.value) ? takerRes.value : [];
+      const tradeMap = new Map([...makerList, ...takerList].map((t) => [t.id, t]));
+      polyTrades = [...tradeMap.values()].slice(0, 100);
+    } catch (_) {}
+  }
+
+  // 2. Fetch Polymarket midpoint prices for all traded token_ids
+  let polyPriceMap = {};
+  const allTokenIds = [...new Set(polyTrades.map((t) => t.asset_id).filter(Boolean))];
+  try {
+    if (allTokenIds.length) {
+      const priceRes = await fetch(
+        `https://clob.polymarket.com/midpoints?token_ids=${allTokenIds.join(',')}`,
+        fetchOptions
+      );
+      const priceData = await priceRes.json();
+      for (const [k, v] of Object.entries(priceData || {})) {
+        const parsed = parseFloat(v?.mid ?? v ?? 0);
+        if (!isNaN(parsed) && parsed > 0) polyPriceMap[k] = parsed;
+      }
+    }
+  } catch (_) {}
+
+  // 2b. Filter out meaningless 50¢ midpoints (happens when book is empty/wide: bid=0, ask=1).
+  //     Replace with actual book mid or null for settled/illiquid markets.
+  for (const id of Object.keys(polyPriceMap)) {
+    const mid = polyPriceMap[id];
+    if (mid >= 0.48 && mid <= 0.52) {
+      // Suspicious 50¢ — verify with the actual orderbook
+      try {
+        const bookRes = await fetch(`https://clob.polymarket.com/book?token_id=${id}`, fetchOptions);
+        if (bookRes.ok) {
+          const book = await bookRes.json();
+          const bid = parseFloat(book.bids?.[0]?.price ?? 0);
+          const ask = parseFloat(book.asks?.[0]?.price ?? 0);
+          if (bid > 0 && ask > 0 && Math.abs(ask - bid) < 0.30) {
+            // Real tight spread — trust it
+            polyPriceMap[id] = (bid + ask) / 2;
+          } else if (bid > 0.55 || ask < 0.45) {
+            // Book heavily one-sided — use best available
+            polyPriceMap[id] = bid > 0.55 ? bid : ask;
+          } else {
+            // Wide/empty book — price is unreliable, mark as null so we show "awaiting settlement"
+            delete polyPriceMap[id];
+          }
+        } else {
+          delete polyPriceMap[id];
+        }
+      } catch (_) {
+        delete polyPriceMap[id];
+      }
+    }
+  }
+
+  // For tokens still missing (not in midpoints at all), try the orderbook
+  const missingIds = allTokenIds.filter((id) => polyPriceMap[id] == null);
+  if (missingIds.length) {
+    await Promise.all(missingIds.map(async (id) => {
+      try {
+        const bookRes = await fetch(`https://clob.polymarket.com/book?token_id=${id}`, fetchOptions);
+        if (bookRes.ok) {
+          const book = await bookRes.json();
+          const bid = parseFloat(book.bids?.[0]?.price ?? 0);
+          const ask = parseFloat(book.asks?.[0]?.price ?? 0);
+          if (bid > 0 && ask > 0 && Math.abs(ask - bid) < 0.30) {
+            polyPriceMap[id] = (bid + ask) / 2;
+          } else if (bid > 0.6) {
+            polyPriceMap[id] = bid;
+          } else if (ask > 0 && ask < 0.40) {
+            polyPriceMap[id] = ask;
+          }
+        }
+      } catch (_) {}
+    }));
+  }
+
+  // 3. Fetch Kalshi positions
+  let kalshiPositions = [];
+  if (req.session?.kalshiCreds) {
+    try {
+      const creds = req.session.kalshiCreds;
+      const path = '/trade-api/v2/portfolio/positions';
+      const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
+      const timestamp = String(Date.now());
+      const signature = kalshiSign(creds.privateKey, timestamp, 'GET', path);
+      const posRes = await fetch(`${baseUrl}${path}?limit=100`, {
+        method: 'GET',
+        headers: {
+          'KALSHI-ACCESS-KEY': creds.apiKeyId,
+          'KALSHI-ACCESS-TIMESTAMP': timestamp,
+          'KALSHI-ACCESS-SIGNATURE': signature,
+        },
+      });
+      if (posRes.ok) {
+        const posData = await posRes.json().catch(() => ({}));
+        kalshiPositions = posData.market_positions || posData.positions || [];
+      }
+    } catch (_) {}
+  }
+
+  // Build a map: kalshi ticker -> position data
+  const kalshiPosMap = new Map();
+  for (const pos of kalshiPositions) {
+    const ticker = pos.ticker || pos.market_ticker || '';
+    if (ticker) kalshiPosMap.set(ticker, pos);
+  }
+
+  // 3a. Build order_id → ticker map by fetching portfolio orders
+  // This lets us match Kalshi positions by exact order ID instead of fuzzy team-name
+  const kalOrderIdToTicker = new Map();
+  if (req.session?.kalshiCreds) {
+    try {
+      const creds = req.session.kalshiCreds;
+      const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
+      const ordPath = '/trade-api/v2/portfolio/orders';
+      const ts2 = String(Date.now());
+      const sig2 = kalshiSign(creds.privateKey, ts2, 'GET', ordPath);
+      const ordRes = await fetch(`${baseUrl}${ordPath}?limit=100&status=all`, {
+        headers: {
+          'KALSHI-ACCESS-KEY': creds.apiKeyId,
+          'KALSHI-ACCESS-TIMESTAMP': ts2,
+          'KALSHI-ACCESS-SIGNATURE': sig2,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (ordRes.ok) {
+        const ordData = await ordRes.json().catch(() => ({}));
+        const orders = ordData.orders || [];
+        for (const o of orders) {
+          if (o.order_id && (o.ticker || o.market_ticker)) {
+            kalOrderIdToTicker.set(o.order_id, o.ticker || o.market_ticker);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 3b. Fetch LIVE bid/ask prices for each Kalshi NBA ticker individually.
+  // The batch ?tickers= param is unreliable; individual GET /markets/{ticker} is authoritative.
+  const kalshiLivePriceMap = new Map(); // ticker -> mid price in cents
+  const nbaTickers = [...kalshiPosMap.keys()].filter((t) => t.startsWith('KXNBAGAME-'));
+  if (nbaTickers.length && req.session?.kalshiCreds) {
+    const creds = req.session.kalshiCreds;
+    const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
+
+    function kalshiMarketMid(m) {
+      if (!m) return null;
+      const isResolved = ['settled', 'finalized', 'determined'].includes((m.status || '').toLowerCase());
+      if (isResolved) {
+        const result = (m.result || '').toLowerCase();
+        if (result === 'yes') return 100;
+        if (result === 'no') return 0;
+        return null;
+      }
+      // Kalshi API v2 returns prices as _dollars strings (e.g. "0.8900") not integer cents
+      let yesBid, yesAsk;
+      if (m.yes_bid_dollars != null) {
+        yesBid = Math.round(parseFloat(m.yes_bid_dollars) * 100);
+        yesAsk = Math.round(parseFloat(m.yes_ask_dollars) * 100);
+      } else {
+        // Fallback: old integer cent fields
+        yesBid = m.yes_bid ?? 0;
+        yesAsk = m.yes_ask ?? 100;
+      }
+      if (yesBid === 0 && yesAsk === 100) return null; // no live market
+      return Math.round((yesBid + yesAsk) / 2);
+    }
+
+    await Promise.all(nbaTickers.slice(0, 15).map(async (ticker) => {
+      try {
+        const mktPath = `/trade-api/v2/markets/${encodeURIComponent(ticker)}`;
+        const ts = String(Date.now());
+        const sig = kalshiSign(creds.privateKey, ts, 'GET', `/trade-api/v2/markets/${ticker}`);
+        const mktRes = await fetch(`${baseUrl}${mktPath}`, {
+          headers: {
+            'KALSHI-ACCESS-KEY': creds.apiKeyId,
+            'KALSHI-ACCESS-TIMESTAMP': ts,
+            'KALSHI-ACCESS-SIGNATURE': sig,
+            'Content-Type': 'application/json',
+          },
+        });
+        if (mktRes.ok) {
+          const mktData = await mktRes.json().catch(() => ({}));
+          const m = mktData.market || mktData;
+          const mid = kalshiMarketMid(m);
+          if (mid != null) kalshiLivePriceMap.set(ticker, mid);
+        }
+      } catch (_) {}
+    }));
+  }
+
+  // 4. Build P&L per arb history entry
+  const TRICODE_TO_NICKNAME_PNL = {
+    ATL:'HAWKS', BOS:'CELTICS', BKN:'NETS', CHA:'HORNETS',
+    CHI:'BULLS', CLE:'CAVALIERS', DAL:'MAVERICKS', DEN:'NUGGETS',
+    DET:'PISTONS', GSW:'WARRIORS', HOU:'ROCKETS', IND:'PACERS',
+    LAC:'CLIPPERS', LAL:'LAKERS', MEM:'GRIZZLIES', MIA:'HEAT',
+    MIL:'BUCKS', MIN:'TIMBERWOLVES', NOP:'PELICANS', NYK:'KNICKS',
+    OKC:'THUNDER', ORL:'MAGIC', PHI:'76ERS', PHX:'SUNS',
+    POR:'TRAIL BLAZERS', SAC:'KINGS', SAS:'SPURS', TOR:'RAPTORS',
+    UTA:'JAZZ', WAS:'WIZARDS',
+  };
+  function outcomeMatchesTri(outcome, tri) {
+    if (!outcome || !tri) return false;
+    const o = outcome.toUpperCase();
+    const t = tri.toUpperCase();
+    if (o.includes(t) || t.includes(o)) return true;
+    const nick = TRICODE_TO_NICKNAME_PNL[t];
+    return nick ? (o.includes(nick) || nick.includes(o)) : false;
+  }
+
+  const positions = arbHistoryItems.map((h) => {
+    const away = (h.awayTeam || '').toUpperCase();
+    const home = (h.homeTeam || '').toUpperCase();
+
+    // Match poly trade: prefer exact order-ID match, fall back to team-name match
+    const polyTrade =
+      (h.polyOrderId
+        ? polyTrades.find((t) =>
+            t.taker_order_id === h.polyOrderId || t.maker_order_id === h.polyOrderId
+          )
+        : null) ||
+      polyTrades.find((t) =>
+        t.outcome && (outcomeMatchesTri(t.outcome, away) || outcomeMatchesTri(t.outcome, home))
+      );
+
+    // Poly leg
+    // Cost basis always comes from arb history (authoritative source).
+    // Trade match is only used to get the asset_id for price lookup — never for share count.
+    let polyCurrentValue = null;
+    let polyOriginalStake = Number(h.stakePolyUsd) || 0;
+    let polyEntryPrice = Number(h.polyPrice) || null;
+    // Compute exact share count from what we actually paid
+    const polyShares = (polyOriginalStake > 0 && polyEntryPrice > 0)
+      ? polyOriginalStake / polyEntryPrice
+      : 0;
+    let polyAssetId = polyTrade ? polyTrade.asset_id : null;
+
+    if (polyAssetId) {
+      const mid = polyPriceMap[polyAssetId];
+      if (mid != null && polyShares > 0) {
+        polyCurrentValue = polyShares * mid;
+      }
+      // mid === null means market is settled (empty book, no midpoint) — show awaiting settlement
+    }
+
+    // Kalshi leg
+    // Entry price from arb history (stored at placement time)
+    let kalCurrentValue = null;
+    let kalOriginalStake = Number(h.stakeKalshiUsd) || 0;
+    // arb history stores it as kalshiYesPriceCents (integer) or kalshiPrice (0-1 float)
+    let kalEntryPrice = h.kalshiYesPriceCents != null
+      ? Number(h.kalshiYesPriceCents)
+      : h.kalshiPrice != null ? Math.round(Number(h.kalshiPrice) * 100) : null;
+    let kalCurrentPrice = null;
+    let kalOrderId = h.kalshiOrderId || null;
+
+    // First try to match position by the exact ticker resolved from the stored order ID
+    let resolvedTicker = kalOrderIdToTicker.get(kalOrderId);
+
+    // Search position map — prefer resolved ticker, fall back to team-name pattern
+    for (const [ticker, pos] of kalshiPosMap) {
+      const isExactMatch = resolvedTicker && ticker === resolvedTicker;
+      if (!isExactMatch) {
+        const mTicker = ticker.match(/KXNBAGAME-\d{2}[A-Z]{3}\d{2}([A-Z]{3})([A-Z]{3})/);
+        if (!mTicker) continue;
+        const tAway = mTicker[1];
+        const tHome = mTicker[2];
+        const matches = (tAway === away || tHome === home || away === tAway || home === tHome);
+        if (!isExactMatch && !matches) continue;
+      }
+
+      let yesCount = Number(pos.position ?? pos.yes_position ?? pos.quantity ?? 0);
+      // Fallback: if position API returns 0 (settled markets removed, or field name mismatch),
+      // compute contract count from arb history: stake / (entryPrice / 100)
+      if (yesCount === 0 && kalOriginalStake > 0 && kalEntryPrice != null && kalEntryPrice > 0) {
+        yesCount = Math.round(kalOriginalStake / (kalEntryPrice / 100));
+      }
+
+      // Derive entry price from total_traded if not stored
+      if (kalEntryPrice == null && pos.total_traded && yesCount > 0) {
+        kalEntryPrice = Math.round(Number(pos.total_traded) / yesCount);
+      }
+
+      // Live current price from separately-fetched market data
+      const liveMid = kalshiLivePriceMap.get(ticker);
+      if (liveMid != null) {
+        kalCurrentPrice = liveMid;
+        kalCurrentValue = (yesCount * liveMid) / 100;
+      } else if (pos.market_value != null) {
+        kalCurrentValue = Number(pos.market_value) / 100;
+        kalCurrentPrice = yesCount > 0 ? Math.round((kalCurrentValue * 100) / yesCount) : null;
+      } else {
+        // No live price available — show cost basis (no change)
+        kalCurrentPrice = kalEntryPrice;
+        kalCurrentValue = kalOriginalStake;
+      }
+      break;
+    }
+
+    if (kalCurrentValue === null && kalOriginalStake > 0) {
+      // Position not found in portfolio (may have been resolved/settled)
+      // Keep as null so we show n/a instead of a fake value
+      kalCurrentValue = null;
+    }
+
+    const polyPnl = polyCurrentValue != null ? polyCurrentValue - polyOriginalStake : null;
+    const kalPnl = kalCurrentValue != null ? kalCurrentValue - kalOriginalStake : null;
+    // Only include legs where we have a real current value — don't inflate/deflate totals with nulls
+    const knownCurrentValue =
+      (polyCurrentValue != null ? polyCurrentValue : 0) +
+      (kalCurrentValue != null ? kalCurrentValue : 0);
+    const knownOriginalStake =
+      (polyCurrentValue != null ? polyOriginalStake : 0) +
+      (kalCurrentValue != null ? kalOriginalStake : 0);
+    const totalStake = polyOriginalStake + kalOriginalStake;
+    const unrealizedPnl = knownOriginalStake > 0 ? knownCurrentValue - knownOriginalStake : 0;
+
+    // Best exit suggestion: if one leg is up >20% more than the other is down
+    let bestExit = null;
+    if (polyPnl != null && kalPnl != null && totalStake > 0) {
+      const polyChangePct = polyOriginalStake > 0 ? (polyPnl / polyOriginalStake) * 100 : 0;
+      const kalChangePct = kalOriginalStake > 0 ? (kalPnl / kalOriginalStake) * 100 : 0;
+      if (polyChangePct - kalChangePct > 20) {
+        bestExit = 'poly';
+      } else if (kalChangePct - polyChangePct > 20) {
+        bestExit = 'kalshi';
+      }
+    }
+
+    // Recommendation logic
+    const expectedProfit = h.netProfitUsd != null ? Number(h.netProfitUsd) : null;
+    const polyAvailable = polyCurrentValue != null;
+    const kalSettledFinal = kalCurrentPrice === 0 || kalCurrentPrice === 100;
+    let recommendation = 'hold';
+    let recommendationText = 'On track — hold for full arb profit at game end';
+
+    if (kalSettledFinal) {
+      // Game is over — direct user to redemption
+      if (kalCurrentPrice === 100) {
+        recommendation = 'close-both';
+        recommendationText = 'Kalshi leg won ✓ — redeem your Polymarket position too';
+      } else {
+        recommendation = 'hold';
+        recommendationText = 'Game over — check Polymarket to redeem the winning side';
+      }
+    } else if (!polyAvailable && kalCurrentPrice != null) {
+      // Poly price unavailable (illiquid book) but game still live on Kalshi
+      recommendation = 'hold';
+      recommendationText = 'Hold — Polymarket book illiquid, await settlement';
+    } else if (expectedProfit != null && expectedProfit > 0.1 && unrealizedPnl > expectedProfit * 1.5) {
+      const pct = Math.round((unrealizedPnl / expectedProfit) * 100);
+      recommendation = 'close-both';
+      recommendationText = `Lock in early: you're at ${pct}% of target profit`;
+    } else if (polyPnl != null && polyOriginalStake > 0 && polyPnl > polyOriginalStake * 0.35) {
+      recommendation = 'sell-poly';
+      recommendationText = 'Poly leg up significantly — sell for early profit';
+    } else if (kalPnl != null && kalOriginalStake > 0 && kalPnl > kalOriginalStake * 0.35) {
+      recommendation = 'sell-kalshi';
+      recommendationText = 'Kalshi leg up significantly — sell';
+    } else if (polyAvailable && totalStake > 0 && unrealizedPnl < -(totalStake * 0.30)) {
+      // Only show cut-loss when we can see BOTH legs
+      recommendation = 'cut-loss';
+      recommendationText = 'Down over 30% — consider closing to limit losses';
+    }
+
+    return {
+      gameKey: h.gameKey,
+      awayTeam: h.awayTeam,
+      homeTeam: h.homeTeam,
+      strategyLabel: h.strategyLabel,
+      placedAt: h.placedAt,
+      polyOriginalStake: Math.round(polyOriginalStake * 100) / 100,
+      polyCurrentValue: polyCurrentValue != null ? Math.round(polyCurrentValue * 100) / 100 : null,
+      polyPnl: polyPnl != null ? Math.round(polyPnl * 100) / 100 : null,
+      kalOriginalStake: Math.round(kalOriginalStake * 100) / 100,
+      kalCurrentValue: kalCurrentValue != null ? Math.round(kalCurrentValue * 100) / 100 : null,
+      kalPnl: kalPnl != null ? Math.round(kalPnl * 100) / 100 : null,
+      unrealizedPnl: Math.round(unrealizedPnl * 100) / 100,
+      bestExit,
+      polyAssetId: polyAssetId || null,
+      polySize: Math.round(polyShares * 100) / 100, // shares from cost basis (always accurate)
+      polyEntryPrice: polyEntryPrice || null,
+      polyCurrentPrice: polyAssetId ? (polyPriceMap[polyAssetId] ?? null) : null,
+      polySettled: polyAssetId && polyPriceMap[polyAssetId] == null, // poly book empty/illiquid
+      gameOver: kalCurrentPrice === 0 || kalCurrentPrice === 100, // market actually resolved on Kalshi
+      kalOrderId: kalOrderId || null,
+      kalEntryPrice: kalEntryPrice,
+      kalCurrentPrice: kalCurrentPrice,
+      expectedProfit: expectedProfit,
+      recommendation,
+      recommendationText,
+    };
+  });
+
+  res.json({ positions });
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.get('/api/arb/engine/status', (req, res) => {
   res.json({ running: arbEngine.running, startedAt: arbEngine.startedAt, stats: arbEngine.stats, config: arbEngine.config });
 });
@@ -1936,15 +2629,15 @@ app.get('/api/arb/engine/status', (req, res) => {
 app.patch('/api/arb/engine/config', (req, res) => {
   const cfg = req.body || {};
   const needsRestart = cfg.intervalMs != null && cfg.intervalMs !== arbEngine.config.intervalMs;
-  if (cfg.betSizeUsd != null) arbEngine.config.betSizeUsd = Number(cfg.betSizeUsd);
+  if (cfg.orderSizeUsd != null) arbEngine.config.orderSizeUsd = Number(cfg.orderSizeUsd);
   if (cfg.intervalMs != null) arbEngine.config.intervalMs = Number(cfg.intervalMs);
   if (cfg.cooldownMs != null) arbEngine.config.cooldownMs = Number(cfg.cooldownMs);
-  if (cfg.kellyFraction != null) arbEngine.config.kellyFraction = Number(cfg.kellyFraction);
+  if (cfg.maxPositionUsd != null) arbEngine.config.maxPositionUsd = Number(cfg.maxPositionUsd);
+  if (cfg.minEdge != null) arbEngine.config.minEdge = Number(cfg.minEdge);
   if (cfg.circuitBreakerPolyUsd != null) arbEngine.config.circuitBreakerPolyUsd = Number(cfg.circuitBreakerPolyUsd);
-  if (cfg.circuitBreakerKalUsd != null) arbEngine.config.circuitBreakerKalUsd = Number(cfg.circuitBreakerKalUsd);
   if (needsRestart && arbEngine.timerId) {
     clearInterval(arbEngine.timerId);
-    arbEngine.timerId = setInterval(runEngineIteration, arbEngine.config.intervalMs);
+    arbEngine.timerId = setInterval(runValueEngineIteration, arbEngine.config.intervalMs);
   }
   broadcastEngineEvent('config_updated', { config: arbEngine.config });
   res.json({ ok: true, config: arbEngine.config });

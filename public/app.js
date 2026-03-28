@@ -91,6 +91,30 @@ let authState = { polymarket: false, kalshi: false };
 let balances = { polymarket: null, kalshi: null };
 let myOrders = { polymarket: { orders: [], error: null }, kalshi: { orders: [], error: null } };
 
+// NBA tricode → full nickname (all caps) for trade outcome matching
+const TRICODE_TO_NICKNAME = {
+  ATL: 'HAWKS', BOS: 'CELTICS', BKN: 'NETS', CHA: 'HORNETS',
+  CHI: 'BULLS', CLE: 'CAVALIERS', DAL: 'MAVERICKS', DEN: 'NUGGETS',
+  DET: 'PISTONS', GSW: 'WARRIORS', HOU: 'ROCKETS', IND: 'PACERS',
+  LAC: 'CLIPPERS', LAL: 'LAKERS', MEM: 'GRIZZLIES', MIA: 'HEAT',
+  MIL: 'BUCKS', MIN: 'TIMBERWOLVES', NOP: 'PELICANS', NYK: 'KNICKS',
+  OKC: 'THUNDER', ORL: 'MAGIC', PHI: '76ERS', PHX: 'SUNS',
+  POR: 'TRAIL BLAZERS', SAC: 'KINGS', SAS: 'SPURS', TOR: 'RAPTORS',
+  UTA: 'JAZZ', WAS: 'WIZARDS',
+};
+
+/** Returns true if a Polymarket trade outcome string matches an NBA tricode.
+ *  Handles nickname ↔ tricode mapping (e.g. "Pacers" ↔ "IND"). */
+function outcomeMatchesTeam(outcome, tricode) {
+  if (!outcome || !tricode) return false;
+  const out = outcome.toUpperCase();
+  const tri = tricode.toUpperCase();
+  if (out.includes(tri) || tri.includes(out)) return true;
+  const nick = TRICODE_TO_NICKNAME[tri];
+  if (nick && (out.includes(nick) || nick.includes(out))) return true;
+  return false;
+}
+
 function renderOddsCell(game, platform, canBet) {
   if (!game) return '<div class="odds-cell"><span class="empty-odds">—</span></div>';
   const homePct = Math.round((game.homeOdds || 0) * 100);
@@ -353,13 +377,8 @@ let engineFeed = [];
 function renderEngineStats() {
   const el = document.getElementById('engineStats');
   if (!el) return;
-  if (!engineRunning && engineStats.betsPlaced === 0) { el.innerHTML = ''; return; }
-  el.innerHTML = `
-    <span>Bets placed: <strong>${engineStats.betsPlaced}</strong></span>
-    <span>Expected profit: <strong>$${(engineStats.expectedProfitUsd || 0).toFixed(2)}</strong></span>
-    <span>Total staked: <strong>$${(engineStats.totalStakedUsd || 0).toFixed(2)}</strong></span>
-    <span>Attempted: <strong>${engineStats.betsAttempted}</strong></span>
-  `;
+  if (!engineStats || !Object.keys(engineStats).length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<span>Bets placed: <strong>${engineStats.betsPlaced||0}</strong></span> · <span>Edge captured: <strong>$${(engineStats.totalEdgeCapture||0).toFixed(2)}</strong></span> · <span>Total staked: <strong>$${(engineStats.totalStakedUsd||0).toFixed(2)}</strong></span> · <span>Attempted: <strong>${engineStats.betsAttempted||0}</strong></span>`;
 }
 
 function renderEngineFeed() {
@@ -370,11 +389,11 @@ function renderEngineFeed() {
   el.innerHTML = engineFeed.slice(0, 50).map((ev) => {
     const time = new Date(ev.ts).toLocaleTimeString();
     if (ev.type === 'bet_placed') {
-      return `<div class="engine-feed-item success">[${time}] ✓ ${ev.strategyLabel} — staked $${(ev.stakePolyUsd||0).toFixed(2)}+$${(ev.stakeKalshiUsd||0).toFixed(2)} | profit ~$${(ev.netProfitUsd||0).toFixed(2)}</div>`;
+      return `<div class="engine-feed-item success">[${time}] ✓ VALUE ${escapeHtml(ev.label||'')} — $${(ev.stakeUsd||0).toFixed(2)} @ edge +${(ev.edge||0).toFixed(1)}% | pos $${(ev.positionTotal||0).toFixed(2)}</div>`;
     } else if (ev.type === 'bet_failed') {
       return `<div class="engine-feed-item error">[${time}] ✗ ${ev.gameKey} — poly: ${ev.polyErr||'ok'} kal: ${ev.kalErr||'ok'}</div>`;
     } else if (ev.type === 'tick') {
-      return `<div class="engine-feed-item">[${time}] tick — ${ev.opportunityCount} opps | Poly $${(ev.polyBal||0).toFixed(2)} Kal $${(ev.kalBal||0).toFixed(2)}</div>`;
+      return `<div class="engine-feed-item">[${time}] tick — ${ev.opportunityCount} value opps | Poly $${(ev.polyBal||0).toFixed(2)}</div>`;
     } else if (ev.type === 'stopped') {
       return `<div class="engine-feed-item error">[${time}] STOPPED — ${ev.reason}</div>`;
     } else if (ev.type === 'error') {
@@ -423,17 +442,14 @@ function openEngineSSE() {
 }
 
 async function startEngine() {
-  if (!authState.polymarket || !authState.kalshi) {
-    alert('Sign in to both Polymarket and Kalshi first.');
-    return;
-  }
+  if (!authState.polymarket) { alert('Sign in to Polymarket first to use the Value Engine.'); return; }
   const config = {
-    betSizeUsd: parseFloat(document.getElementById('engineBetSize')?.value) || 2,
-    intervalMs: parseInt(document.getElementById('engineInterval')?.value) || 3000,
-    cooldownMs: parseInt(document.getElementById('engineCooldown')?.value) || 30000,
-    kellyFraction: parseFloat(document.getElementById('engineKelly')?.value) || 0.25,
+    orderSizeUsd: parseFloat(document.getElementById('engineBetSize')?.value) || 2,
+    maxPositionUsd: parseFloat(document.getElementById('engineMaxPosition')?.value) || 20,
+    minEdge: (parseFloat(document.getElementById('engineMinEdge')?.value) || 3) / 100,
+    intervalMs: parseInt(document.getElementById('engineInterval')?.value) || 5000,
+    cooldownMs: parseInt(document.getElementById('engineCooldown')?.value) || 60000,
     circuitBreakerPolyUsd: parseFloat(document.getElementById('engineCircuitPoly')?.value) || 5,
-    circuitBreakerKalUsd: parseFloat(document.getElementById('engineCircuitKal')?.value) || 5,
   };
   try {
     const res = await fetch(`${API_BASE}/api/arb/engine/start`, {
@@ -446,7 +462,7 @@ async function startEngine() {
     if (!res.ok) { alert(data.error || 'Failed to start engine'); return; }
     engineRunning = true;
     engineFeed = [];
-    engineStats = { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, expectedProfitUsd: 0 };
+    engineStats = { betsPlaced: 0, betsAttempted: 0, totalStakedUsd: 0, totalEdgeCapture: 0 };
     openEngineSSE();
     updateEngineUI();
   } catch (err) {
@@ -798,6 +814,237 @@ function showToast(msg, type = 'success') {
   setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 400); }, 4000);
 }
 
+// ── Real-time P&L tracker ─────────────────────────────────────────────────
+let pnlData = []; // latest /api/pnl response
+let pnlRefreshTimerId = null;
+
+async function fetchPnl(silent = false) {
+  if (!authState.polymarket && !authState.kalshi) return;
+  try {
+    const res = await fetchWithTimeout(`${API_BASE}/api/pnl`);
+    if (!res.ok) return;
+    const data = await res.json();
+    pnlData = data.positions || [];
+    renderPnlRows();
+  } catch (_) {}
+}
+
+function startPnlAutoRefresh() {
+  if (pnlRefreshTimerId != null) return;
+  fetchPnl(true);
+  pnlRefreshTimerId = setInterval(() => fetchPnl(true), 10000);
+}
+
+function stopPnlAutoRefresh() {
+  if (pnlRefreshTimerId != null) {
+    clearInterval(pnlRefreshTimerId);
+    pnlRefreshTimerId = null;
+  }
+}
+
+function renderPositionsPanel() {
+  const panel = document.getElementById('positionsPanel');
+  const portfolioBar = document.getElementById('posPortfolioBar');
+  const list = document.getElementById('posList');
+  if (!panel || !list) return;
+
+  if (!pnlData.length) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+
+  // Portfolio summary
+  let totalInvested = 0, totalCurrent = 0;
+  for (const pos of pnlData) {
+    totalInvested += (pos.polyOriginalStake || 0) + (pos.kalOriginalStake || 0);
+    // Only count current values we actually have — don't fall back to stake for missing prices
+    totalCurrent += (pos.polyCurrentValue ?? 0) + (pos.kalCurrentValue ?? 0);
+  }
+  const netPnl = totalCurrent - totalInvested;
+  const pctReturn = totalInvested > 0 ? (netPnl / totalInvested * 100) : 0;
+  const portfolioClass = netPnl >= 0 ? 'pos-pnl-positive' : 'pos-pnl-negative';
+  if (portfolioBar) {
+    portfolioBar.hidden = false;
+    portfolioBar.innerHTML = `
+      <div class="pos-portfolio-stat"><span class="pos-portfolio-label">Invested</span><span class="pos-portfolio-val">$${totalInvested.toFixed(2)}</span></div>
+      <div class="pos-portfolio-stat"><span class="pos-portfolio-label">Current Value</span><span class="pos-portfolio-val">$${totalCurrent.toFixed(2)}</span></div>
+      <div class="pos-portfolio-stat"><span class="pos-portfolio-label">Net P&amp;L</span><span class="pos-portfolio-val ${portfolioClass}">${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}</span></div>
+      <div class="pos-portfolio-stat"><span class="pos-portfolio-label">Return</span><span class="pos-portfolio-val ${portfolioClass}">${pctReturn >= 0 ? '+' : ''}${pctReturn.toFixed(1)}%</span></div>
+    `;
+  }
+
+  // Per-position cards
+  list.innerHTML = pnlData.map(pos => {
+    const date = pos.placedAt ? new Date(pos.placedAt).toLocaleDateString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' }) : '';
+
+    // POLY leg
+    const polyEntry = pos.polyEntryPrice != null ? (pos.polyEntryPrice * 100).toFixed(0) : null;
+    const polyCurrent = pos.polyCurrentPrice != null ? (pos.polyCurrentPrice * 100).toFixed(0) : null;
+    const polyPnlSign = pos.polyPnl >= 0 ? '+' : '';
+    const polyPnlClass = pos.polyPnl >= 0 ? 'pos-pnl-positive' : 'pos-pnl-negative';
+    const polyBarWidth = pos.polyEntryPrice > 0 && pos.polyCurrentPrice != null
+      ? Math.min(100, Math.round(pos.polyCurrentPrice * 100)) : 0;
+    const polyEntryBarWidth = pos.polyEntryPrice > 0 ? Math.min(100, Math.round(pos.polyEntryPrice * 100)) : 0;
+    const polyAction = pos.polyAssetId && pos.polySize
+      ? `<button class="pos-action-btn sell" onclick="sellPolyPosition('${pos.polyAssetId}', ${pos.polySize}, this)">Sell</button>`
+      : '';
+
+    // KAL leg
+    const kalEntry = pos.kalEntryPrice != null ? pos.kalEntryPrice : null;
+    const kalCurrent = pos.kalCurrentPrice != null ? pos.kalCurrentPrice : null;
+    const kalPnlSign = pos.kalPnl >= 0 ? '+' : '';
+    const kalPnlClass = pos.kalPnl >= 0 ? 'pos-pnl-positive' : 'pos-pnl-negative';
+    const kalBarWidth = kalCurrent != null ? Math.min(100, Math.round(kalCurrent)) : 0;
+    const kalEntryBarWidth = kalEntry != null ? Math.min(100, Math.round(kalEntry)) : 0;
+    const kalAction = pos.kalOrderId
+      ? `<button class="pos-action-btn cancel" onclick="cancelKalshiOrderFromDashboard('${pos.kalOrderId}', this)">Cancel</button>`
+      : '';
+
+    // Recommendation badge
+    const recMap = {
+      'close-both': { cls: 'rec-close', icon: '🎯' },
+      'sell-poly': { cls: 'rec-sell', icon: '💰' },
+      'sell-kalshi': { cls: 'rec-sell', icon: '💰' },
+      'cut-loss': { cls: 'rec-danger', icon: '⚠️' },
+      'hold': { cls: 'rec-hold', icon: '✋' },
+    };
+    const rec = recMap[pos.recommendation] || recMap['hold'];
+    const recBadge = pos.recommendationText
+      ? `<div class="pos-rec-badge ${rec.cls}">${rec.icon} ${escapeHtml(pos.recommendationText)}</div>`
+      : '';
+
+    // Combined P&L
+    const posPnlClass = pos.unrealizedPnl >= 0 ? 'pos-pnl-positive' : 'pos-pnl-negative';
+    const expectedLine = pos.expectedProfit
+      ? `<span class="pos-expected">Target: +$${Number(pos.expectedProfit).toFixed(2)}</span>`
+      : '';
+
+    return `<div class="pos-card" data-game-key="${escapeHtml(pos.gameKey || '')}">
+      <div class="pos-card-header">
+        <span class="pos-game">🏀 ${escapeHtml(pos.awayTeam || '')} @ ${escapeHtml(pos.homeTeam || '')}</span>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span class="trade-badge arb">ARB</span>
+          <span class="pos-date">${escapeHtml(date)}</span>
+        </div>
+      </div>
+
+      <div class="pos-legs">
+        <!-- POLY leg -->
+        <div class="pos-leg pos-leg-poly">
+          <div class="pos-leg-header">
+            <span class="leg-label" style="background:var(--accent-poly);color:#fff">POLY</span>
+            <span class="pos-leg-team">${escapeHtml(pos.strategyLabel ? pos.strategyLabel.split(' ').slice(0,2).join(' ') : pos.awayTeam || '')}</span>
+            ${polyAction}
+          </div>
+          <div class="pos-price-row">
+            <span class="pos-price-entry">Entry: ${polyEntry != null ? polyEntry + '¢' : 'n/a'}</span>
+            <span class="pos-arrow">→</span>
+            <span class="pos-price-current ${pos.polyCurrentPrice > pos.polyEntryPrice ? 'pos-pnl-positive' : pos.polyCurrentPrice < pos.polyEntryPrice ? 'pos-pnl-negative' : ''}">${
+              polyCurrent != null ? polyCurrent + '¢'
+              : pos.gameOver ? '<span style="color:#22c55e;font-size:0.7rem">settled</span>'
+              : pos.polySettled ? '<span style="color:#f59e0b;font-size:0.7rem">illiquid</span>'
+              : '—'
+            }</span>
+          </div>
+          <div class="pos-bar-wrap">
+            <div class="pos-bar-track">
+              <div class="pos-bar-entry" style="width:${polyEntryBarWidth}%"></div>
+              <div class="pos-bar-current" style="width:${polyBarWidth}%;background:${pos.polyCurrentPrice > pos.polyEntryPrice ? '#22c55e' : '#ef4444'}"></div>
+            </div>
+          </div>
+          <div class="pos-value-row">
+            <span>$${(pos.polyOriginalStake || 0).toFixed(2)} → ${
+              pos.polyCurrentValue != null
+                ? '$' + pos.polyCurrentValue.toFixed(2)
+                : pos.gameOver
+                  ? '<span style="color:#22c55e;font-size:0.72rem">🏆 Game over — redeem on Polymarket</span>'
+                  : pos.polySettled
+                    ? '<span style="color:#f59e0b;font-size:0.72rem">⏳ Book illiquid — check Polymarket</span>'
+                    : pos.polyAssetId
+                      ? '<span style="color:var(--text-muted);font-size:0.7rem">⏳ price loading…</span>'
+                      : '<span style="color:var(--text-muted)">n/a</span>'
+            }</span>
+            ${pos.polyPnl != null ? `<span class="${polyPnlClass}">${polyPnlSign}$${Math.abs(pos.polyPnl).toFixed(2)}</span>` : ''}
+          </div>
+        </div>
+
+        <!-- KAL leg -->
+        <div class="pos-leg pos-leg-kal">
+          <div class="pos-leg-header">
+            <span class="leg-label" style="background:var(--accent-kalshi);color:#000">KAL</span>
+            <span class="pos-leg-team">${escapeHtml(pos.strategyLabel ? pos.strategyLabel.split(' ').slice(-2).join(' ') : pos.homeTeam || '')}</span>
+            ${kalAction}
+          </div>
+          <div class="pos-price-row">
+            <span class="pos-price-entry">Entry: ${kalEntry != null ? kalEntry + '¢' : 'n/a'}</span>
+            <span class="pos-arrow">→</span>
+            <span class="pos-price-current ${kalCurrent > kalEntry ? 'pos-pnl-positive' : kalCurrent < kalEntry ? 'pos-pnl-negative' : ''}">${kalCurrent != null ? kalCurrent + '¢' : '—'}</span>
+          </div>
+          <div class="pos-bar-wrap">
+            <div class="pos-bar-track">
+              <div class="pos-bar-entry" style="width:${kalEntryBarWidth}%"></div>
+              <div class="pos-bar-current" style="width:${kalBarWidth}%;background:${kalCurrent > kalEntry ? '#22c55e' : '#ef4444'}"></div>
+            </div>
+          </div>
+          <div class="pos-value-row">
+            <span>$${(pos.kalOriginalStake || 0).toFixed(2)} → ${
+              pos.kalCurrentPrice === 0
+                ? '<span style="color:#ef4444;font-size:0.7rem">settled ✗ lost</span>'
+                : pos.kalCurrentPrice === 100
+                ? '<span class="pos-pnl-positive" style="font-size:0.7rem">settled ✓ won</span>'
+                : pos.kalCurrentValue != null
+                ? (pos.kalCurrentValue >= pos.kalOriginalStake * 1.5
+                    ? `<span class="pos-pnl-positive">$${pos.kalCurrentValue.toFixed(2)} ✓</span>`
+                    : '$' + pos.kalCurrentValue.toFixed(2))
+                : '<span style="color:var(--text-muted)">n/a</span>'
+            }</span>
+            ${pos.kalPnl != null && pos.kalCurrentPrice !== 0 ? `<span class="${kalPnlClass}">${kalPnlSign}$${Math.abs(pos.kalPnl).toFixed(2)}</span>` : ''}
+          </div>
+        </div>
+      </div>
+
+      <div class="pos-footer">
+        <div class="pos-combined-pnl">
+          ${pos.gameOver
+            ? `<span style="color:#22c55e;font-weight:600">🏁 Game settled — redeem winning position</span>`
+            : pos.polySettled && !pos.gameOver
+              ? `<span style="color:var(--text-muted)">Combined P&amp;L:</span>
+                 <span class="${posPnlClass}" style="font-weight:700">${pos.unrealizedPnl >= 0 ? '+' : ''}$${Number(pos.unrealizedPnl).toFixed(2)}</span>
+                 <span style="color:#f59e0b;font-size:0.7rem">(Poly unavailable)</span>
+                 ${expectedLine}`
+              : `<span>Combined P&amp;L:</span>
+                 <span class="${posPnlClass}" style="font-weight:700">${pos.unrealizedPnl >= 0 ? '+' : ''}$${Number(pos.unrealizedPnl).toFixed(2)}</span>
+                 ${expectedLine}`
+          }
+        </div>
+        ${recBadge}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// Keep old renderPnlRows as a wrapper that calls renderPositionsPanel + injects into dashboard cards
+function renderPnlRows() {
+  renderPositionsPanel();
+  // Also update dashboard arb-pair-cards if present
+  const cards = document.querySelectorAll('.arb-pair-card[data-game-key]');
+  for (const card of cards) {
+    const gk = card.dataset.gameKey;
+    const pos = pnlData.find((p) => p.gameKey === gk);
+    let existing = card.querySelector('.pnl-row');
+    if (existing) existing.remove();
+    if (!pos) continue;
+    const row = document.createElement('div');
+    row.className = 'pnl-row';
+    const pnlSign = pos.unrealizedPnl >= 0 ? '+' : '';
+    const pnlClass = pos.unrealizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative';
+    row.innerHTML = `<div class="pnl-total ${pnlClass}">P&amp;L: ${pnlSign}$${Math.abs(pos.unrealizedPnl).toFixed(2)} unrealized${pos.recommendationText ? ' · ' + pos.recommendationText : ''}</div>`;
+    card.appendChild(row);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── Arb History ───────────────────────────────────────────────────────────
 let arbHistory = [];
 
@@ -867,8 +1114,8 @@ function renderTradeCard(t, accentClass) {
   const date = t.created_at ? new Date(t.created_at * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
   const rs = t.result_status || 'pending';
   const isArb = arbHistory.some((h) =>
-    (h.awayTeam && team.toLowerCase().includes(h.awayTeam.toLowerCase())) ||
-    (h.homeTeam && team.toLowerCase().includes(h.homeTeam.toLowerCase()))
+    (h.awayTeam && (outcomeMatchesTeam(team, h.awayTeam) || team.toLowerCase().includes(h.awayTeam.toLowerCase()))) ||
+    (h.homeTeam && (outcomeMatchesTeam(team, h.homeTeam) || team.toLowerCase().includes(h.homeTeam.toLowerCase())))
   );
   const badge = rs === 'win'
     ? `<span class="trade-badge win">WIN ✓</span>`
@@ -892,7 +1139,10 @@ function renderTradeCard(t, accentClass) {
       <span class="trade-meta">Stake: ${stake}</span>
     </div>
     ${profitLine}
-    <div class="trade-date">${date}</div>
+    <div class="trade-card-bottom">
+      <span class="trade-date">${date}</span>
+      ${rs === 'pending' ? `<button class="sell-btn" onclick="sellPolyPosition('${t.asset_id}',${Number(t.size)},this)">Sell</button>` : ''}
+    </div>
   </div>`;
 }
 
@@ -924,6 +1174,83 @@ function renderKalshiOrderCard(o) {
   </div>`;
 }
 
+async function cancelKalshiOrderFromDashboard(orderId, btn) {
+  if (!confirm('Cancel this Kalshi order?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Cancelling…';
+  try {
+    const res = await fetch('/api/kalshi/cancel-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_id: orderId }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      btn.textContent = 'Failed';
+      alert('Cancel failed: ' + (data.error || 'Unknown'));
+    } else {
+      btn.textContent = 'Cancelled';
+      btn.style.background = '#555';
+      setTimeout(fetchMyOrders, 1500);
+    }
+  } catch (e) { btn.textContent = 'Error'; alert(e.message); }
+}
+
+async function cancelPolyOrder(orderId, btn) {
+  if (!confirm('Cancel this open order?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Cancelling…';
+  try {
+    const res = await fetch('/api/polymarket/cancel-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_id: orderId }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      btn.textContent = 'Failed';
+      btn.style.color = 'var(--red)';
+      alert('Cancel failed: ' + (data.error || 'Unknown error'));
+    } else {
+      btn.textContent = 'Cancelled';
+      btn.style.background = '#555';
+      btn.style.color = '#fff';
+      (btn.closest('.trade-card') || btn.closest('.arb-pair-card') || btn.closest('.arb-leg'))?.style && ((btn.closest('.trade-card') || btn.closest('.arb-pair-card')).style.opacity = '0.4');
+      setTimeout(fetchMyOrders, 1500);
+    }
+  } catch (e) {
+    btn.textContent = 'Error';
+    alert('Cancel error: ' + e.message);
+  }
+}
+
+async function sellPolyPosition(assetId, size, btn) {
+  if (!confirm(`Sell ${size} shares at best bid price?`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Selling…';
+  try {
+    const res = await fetch('/api/polymarket/sell-position', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asset_id: assetId, size }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      btn.textContent = 'Failed';
+      btn.style.color = 'var(--red)';
+      alert('Sell failed: ' + (data.error || 'Unknown error'));
+    } else {
+      btn.textContent = `Sold @ ${(data.sellPrice * 100).toFixed(0)}¢`;
+      btn.style.background = 'var(--green)';
+      btn.style.color = '#000';
+      fetchMyOrders();
+    }
+  } catch (e) {
+    btn.textContent = 'Error';
+    alert('Sell error: ' + e.message);
+  }
+}
+
 function switchOrdersTab(tab) {
   document.querySelectorAll('.orders-tab').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === tab));
   document.querySelectorAll('.orders-panel').forEach((panel) => panel.classList.toggle('hidden', !panel.id.endsWith(tab)));
@@ -933,47 +1260,136 @@ function renderDashboard() {
   const hint = document.getElementById('dashboardHint');
   const content = document.getElementById('dashboardContent');
   if (!authState.polymarket && !authState.kalshi) {
-    hint.hidden = false;
-    content.hidden = true;
-    return;
+    hint.hidden = false; content.hidden = true; return;
   }
-  hint.hidden = true;
-  content.hidden = false;
+  hint.hidden = true; content.hidden = false;
 
   const polyTrades = myOrders.polymarket?.trades || [];
+  const polyOpenOrders = (myOrders.polymarket?.orders || []).filter(o => ['live','open','resting'].includes((o.status||'').toLowerCase()));
   const polyErr = myOrders.polymarket?.error;
-  const kalshiAllOrders = myOrders.kalshi?.orders || [];
-  const kalshiOrders = kalshiAllOrders.filter((o) => {
+  const kalshiOrders = (myOrders.kalshi?.orders || []).filter(o => {
     const ticker = o.ticker || o.market_ticker || '';
-    const status = (o.status || '').toLowerCase();
-    return ticker.startsWith('KXNBAGAME-') && (status === 'resting' || status === 'pending' || status === 'open');
+    return ticker.startsWith('KXNBAGAME-') && ['resting','pending','open'].includes((o.status||'').toLowerCase());
   });
   const kalshiErr = myOrders.kalshi?.error;
 
-  const tabs = [];
-  const panels = [];
+  // Build arb pair cards from arbHistory — match poly trades + kalshi orders to each arb
+  const usedPolyIds = new Set();
+  const usedKalshiIds = new Set();
 
-  if (authState.polymarket) {
-    tabs.push(`<button class="orders-tab active" data-tab="poly" onclick="switchOrdersTab('poly')">Polymarket</button>`);
-    panels.push(`<div class="orders-panel" id="orders-panel-poly">
-      ${polyErr ? `<p class="order-detail" style="color:var(--red);padding:4px">${escapeHtml(polyErr)}</p>` : ''}
-      ${polyTrades.length === 0 && !polyErr ? '<p class="order-detail" style="color:var(--text-muted);padding:8px 0">No filled trades yet</p>' : ''}
-      ${polyTrades.map((t) => renderTradeCard(t, 'poly')).join('')}
-    </div>`);
+  const arbCards = arbHistory.slice().reverse().map(h => {
+    const away = (h.awayTeam || '').toUpperCase();
+    const home = (h.homeTeam || '').toUpperCase();
+    const date = h.placedAt ? new Date(h.placedAt).toLocaleDateString('en-US', { month:'short', day:'numeric' }) : '';
+
+    // Match poly filled trade by team name (handles tricode ↔ nickname, e.g. IND ↔ Pacers)
+    const polyTrade = polyTrades.find(t => !usedPolyIds.has(t.id) && t.outcome &&
+      (outcomeMatchesTeam(t.outcome, away) || outcomeMatchesTeam(t.outcome, home)));
+    if (polyTrade) usedPolyIds.add(polyTrade.id);
+
+    // Also match poly open order (unmatched/live) if no filled trade found
+    const polyOpenOrder = !polyTrade ? polyOpenOrders.find(o => !usedPolyIds.has(o.id)) : null;
+    if (polyOpenOrder) usedPolyIds.add(polyOpenOrder.id);
+
+    // Match kalshi order by ticker game
+    const kalOrder = kalshiOrders.find(o => {
+      if (usedKalshiIds.has(o.order_id || o.id)) return false;
+      const m = kalshiTickerToMatchup(o.ticker || o.market_ticker || '');
+      if (!m) return false;
+      return (m.away.toUpperCase().includes(away) || m.home.toUpperCase().includes(home) ||
+              away.includes(m.away.toUpperCase()) || home.includes(m.home.toUpperCase()));
+    });
+    if (kalOrder) usedKalshiIds.add(kalOrder.order_id || kalOrder.id);
+
+    const rs = polyTrade?.result_status || 'pending';
+    const statusBadge = rs === 'win' ? `<span class="trade-badge win">WIN ✓</span>`
+      : rs === 'loss' ? `<span class="trade-badge loss">LOSS ✗</span>`
+      : `<span class="trade-badge pending">PENDING</span>`;
+
+    // Build poly leg — filled trade gets Sell, open order gets Cancel
+    let polyLine = '';
+    if (polyTrade) {
+      const polyBtn = rs === 'pending' && polyTrade.asset_id
+        ? `<button class="leg-sell-btn" onclick="sellPolyPosition('${polyTrade.asset_id}',${Number(polyTrade.size)},this)">Sell</button>` : '';
+      polyLine = `<div class="arb-leg poly-leg"><span class="leg-label">POLY</span><span class="leg-team">${escapeHtml(polyTrade.outcome||'')}</span><span class="leg-detail">${(polyTrade.price*100).toFixed(0)}¢ · $${(polyTrade.stake||0).toFixed(2)}</span>${polyBtn}</div>`;
+    } else if (polyOpenOrder) {
+      const price = polyOpenOrder.price != null ? (Number(polyOpenOrder.price)*100).toFixed(0)+'¢' : '';
+      const stake = polyOpenOrder.original_size && polyOpenOrder.price ? '$'+(Number(polyOpenOrder.original_size)*Number(polyOpenOrder.price)).toFixed(2) : `$${(h.stakePolyUsd||0).toFixed(2)}`;
+      polyLine = `<div class="arb-leg poly-leg"><span class="leg-label">POLY</span><span class="leg-team">${polyOpenOrder.side||'BUY'} ${price}</span><span class="leg-detail">${stake} · unmatched</span><button class="leg-sell-btn" onclick="cancelPolyOrder('${polyOpenOrder.id}',this)">Cancel</button></div>`;
+    } else if (h.stakePolyUsd) {
+      polyLine = `<div class="arb-leg poly-leg"><span class="leg-label">POLY</span><span class="leg-team">${escapeHtml(h.awayTeam||h.homeTeam||'')}</span><span class="leg-detail">$${h.stakePolyUsd.toFixed(2)}</span></div>`;
+    }
+
+    const kalTeam = kalOrder ? (kalshiTickerToTeam(kalOrder.ticker||kalOrder.market_ticker||'') || '') : '';
+    const kalPrice = kalOrder ? (kalOrder.yes_price ?? kalOrder.order?.yes_price ?? '') : '';
+    const kalStake = kalOrder && kalOrder.count ? '$'+((Number(kalOrder.count||0)*Number(kalPrice||0))/100).toFixed(2) : '';
+    const kalOrderId = kalOrder ? (kalOrder.order_id || kalOrder.id || '') : '';
+    const kalLine = kalOrder
+      ? `<div class="arb-leg kal-leg"><span class="leg-label">KAL</span><span class="leg-team">${escapeHtml(kalTeam)}</span><span class="leg-detail">${kalPrice}¢ · ${kalStake}</span>${kalOrderId ? `<button class="leg-sell-btn" onclick="cancelKalshiOrderFromDashboard('${kalOrderId}',this)">Cancel</button>` : ''}</div>`
+      : h.stakeKalshiUsd ? `<div class="arb-leg kal-leg"><span class="leg-label">KAL</span><span class="leg-team">${escapeHtml(h.strategyLabel||'')}</span><span class="leg-detail">$${h.stakeKalshiUsd.toFixed(2)}</span></div>` : '';
+
+    const profitLine = h.netProfitUsd ? `<div class="arb-profit">Expected profit: <strong>+$${Number(h.netProfitUsd).toFixed(2)}</strong></div>` : '';
+
+    return `<div class="arb-pair-card" data-game-key="${escapeHtml(h.gameKey || gameKey(away, home))}">
+      <div class="arb-pair-header">
+        <span class="arb-pair-game">🏀 ${escapeHtml(away)} @ ${escapeHtml(home)}</span>
+        <div style="display:flex;gap:4px"><span class="trade-badge arb">ARB</span>${statusBadge}</div>
+      </div>
+      ${polyLine}${kalLine}
+      <div class="arb-pair-footer">${profitLine}<span class="trade-date">${date}</span></div>
+    </div>`;
+  }).filter(Boolean);
+
+  // Standalone poly trades not matched to any arb
+  const standalonePoly = polyTrades.filter(t => !usedPolyIds.has(t.id));
+  // Standalone kalshi orders not matched
+  const standaloneKal = kalshiOrders.filter(o => !usedKalshiIds.has(o.order_id || o.id));
+
+  const openOrdersHtml = polyOpenOrders.map(o => {
+    const price = o.price != null ? (Number(o.price)*100).toFixed(0)+'¢' : '';
+    const size = o.original_size != null ? Number(o.original_size).toFixed(0)+' shares' : '';
+    const stake = o.original_size && o.price ? '$'+(Number(o.original_size)*Number(o.price)).toFixed(2) : '';
+    return `<div class="arb-pair-card" style="border-left-color:#f59e0b">
+      <div class="arb-pair-header">
+        <span class="arb-pair-game">📋 Open Order</span>
+        <span class="trade-badge pending">UNMATCHED</span>
+      </div>
+      <div class="arb-leg poly-leg"><span class="leg-label">POLY</span><span class="leg-team">${o.side||'BUY'}</span><span class="leg-detail">${size} @ ${price} · ${stake}</span></div>
+      <div class="arb-pair-footer"><span></span><button class="sell-btn" onclick="cancelPolyOrder('${o.id}',this)">Cancel</button></div>
+    </div>`;
+  }).join('');
+
+  const standalonePolyHtml = standalonePoly.map(t => renderTradeCard(t, 'poly')).join('');
+  const standaloneKalHtml = standaloneKal.map(o => renderKalshiOrderCard(o)).join('');
+
+  const pnlToolbar = arbCards.length > 0
+    ? `<div class="pnl-toolbar">
+        <span class="pnl-label">Real-time P&amp;L</span>
+        <button class="auth-btn" id="refreshPnlBtn" onclick="fetchPnl()" style="font-size:0.75rem;padding:2px 8px">↺ Refresh P&amp;L</button>
+        <span class="pnl-auto-hint">auto-refreshes every 10s</span>
+       </div>`
+    : '';
+
+  const allContent = [
+    pnlToolbar,
+    arbCards.join(''),
+    openOrdersHtml,
+    standalonePolyHtml || standaloneKalHtml ? `<div class="orders-col-header poly-header" style="margin-top:12px">Manual bets</div>` + standalonePolyHtml + standaloneKalHtml : '',
+    arbCards.length === 0 && !openOrdersHtml && !standalonePolyHtml && !standaloneKalHtml
+      ? '<p class="order-detail" style="color:var(--text-muted);padding:8px 0">No bets yet</p>' : '',
+    polyErr ? `<p class="order-detail" style="color:var(--red)">${escapeHtml(polyErr)}</p>` : '',
+    kalshiErr ? `<p class="order-detail" style="color:var(--red)">${escapeHtml(kalshiErr)}</p>` : '',
+  ].join('');
+
+  content.innerHTML = allContent;
+
+  // After rendering, inject current P&L data and start auto-refresh
+  if (arbCards.length > 0) {
+    renderPnlRows();
+    startPnlAutoRefresh();
+  } else {
+    stopPnlAutoRefresh();
   }
-
-  if (authState.kalshi) {
-    tabs.push(`<button class="orders-tab${!authState.polymarket ? ' active' : ''}" data-tab="kalshi" onclick="switchOrdersTab('kalshi')">Kalshi</button>`);
-    panels.push(`<div class="orders-panel${authState.polymarket ? ' hidden' : ''}" id="orders-panel-kalshi">
-      ${kalshiErr ? `<p class="order-detail" style="color:var(--red);padding:4px">${escapeHtml(kalshiErr)}</p>` : ''}
-      ${kalshiOrders.length === 0 && !kalshiErr ? '<p class="order-detail" style="color:var(--text-muted);padding:8px 0">No open orders</p>' : ''}
-      ${kalshiOrders.slice(0, 20).map((o) => renderKalshiOrderCard(o)).join('')}
-    </div>`);
-  }
-
-  content.innerHTML = `
-    <div class="orders-tabs">${tabs.join('')}</div>
-    ${panels.join('')}`;
 }
 
 function formatBalance(platform) {
@@ -1013,6 +1429,7 @@ function updateAuthUI() {
   if (enablePolyUsdcManual) enablePolyUsdcManual.style.display = needAllowance ? 'inline-block' : 'none';
   const enablePolyUsdcCtfManual = document.getElementById('enablePolyUsdcCtfManual');
   if (enablePolyUsdcCtfManual) enablePolyUsdcCtfManual.style.display = needAllowance ? 'inline-block' : 'none';
+  if (authState.polymarket || authState.kalshi) startPnlAutoRefresh();
 }
 
 function openBetModal(platform, key) {
@@ -1392,6 +1809,10 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
   const simStopBtn = document.getElementById('simStopBtn');
   if (simStartBtn) simStartBtn.addEventListener('click', startSimulation);
   if (simStopBtn) simStopBtn.addEventListener('click', stopSimulation);
+  const engineStartBtn = document.getElementById('engineStartBtn');
+  const engineStopBtn = document.getElementById('engineStopBtn');
+  if (engineStartBtn) engineStartBtn.addEventListener('click', startEngine);
+  if (engineStopBtn) engineStopBtn.addEventListener('click', stopEngine);
   const simBalancesEl = document.getElementById('simBalances');
   if (simBalancesEl && !simRunning) simBalancesEl.textContent = `Poly $${SIM_INITIAL_POLY}  ·  Kalshi $${SIM_INITIAL_KAL}  ·  Total $${SIM_INITIAL_POLY + SIM_INITIAL_KAL} (initial)`;
 })();
