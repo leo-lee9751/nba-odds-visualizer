@@ -631,6 +631,39 @@ body {
   color: var(--text);
 }
 
+.arb-engine-header-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.arb-sport-tabs {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.arb-sport-tab {
+  display: flex;
+  cursor: pointer;
+}
+.arb-sport-tab input { display: none; }
+.arb-sport-tab span {
+  display: block;
+  padding: 4px 11px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: transparent;
+  transition: background 0.15s, color 0.15s;
+  letter-spacing: 0.03em;
+}
+.arb-sport-tab input:checked + span {
+  background: var(--accent-poly);
+  color: #fff;
+}
+
 .arb-engine-config-row {
   display: flex;
   align-items: flex-end;
@@ -877,11 +910,19 @@ body {
   50% { opacity: 0.3; }
 }
 
-/* Closed early position card */
+/* Closed position card (in separate closed section) */
 .arb-pos-card--closed {
-  opacity: 0.82;
-  border-color: rgba(34,197,94,0.35);
-  background: rgba(34,197,94,0.03);
+  opacity: 0.75;
+}
+.arb-section-label--closed {
+  color: var(--text-muted);
+  margin-top: 1rem;
+}
+a.arb-pos-leg-platform {
+  text-decoration: none;
+}
+a.arb-pos-leg-platform:hover {
+  text-decoration: underline;
 }
 .arb-pos-footer--closed {
   display: flex;
