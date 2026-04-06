@@ -104,6 +104,99 @@
         <h3 class="live-title">Live now</h3>
         <div class="live-content" id="liveContent"></div>
       </section>
+      <section class="engine-panel" id="autoArbPanel">
+
+        <!-- Header + controls -->
+        <div class="arb-engine-header">
+          <div>
+            <h3 class="arb-title">⚡ Auto-Arb Engine</h3>
+            <p class="arb-hint">Executes risk-free arbs automatically via WebSocket price feeds.</p>
+          </div>
+          <div class="arb-engine-mode-btns">
+            <label class="arb-mode-tab">
+              <input type="radio" name="autoArbMode" value="sim" id="autoArbModeSim" checked>
+              <span>Simulation</span>
+            </label>
+            <label class="arb-mode-tab">
+              <input type="radio" name="autoArbMode" value="real" id="autoArbModeReal">
+              <span>Real money</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Config row -->
+        <div class="arb-engine-config-row">
+          <div id="autoArbSimConfig" class="arb-engine-config-group">
+            <label class="arb-cfg-label">Fake Poly ($)
+              <input type="number" id="autoArbSimPoly" value="1000" min="10" step="10">
+            </label>
+            <label class="arb-cfg-label">Fake Kalshi ($)
+              <input type="number" id="autoArbSimKal" value="1000" min="10" step="10">
+            </label>
+          </div>
+          <label class="arb-cfg-label">Max stake / arb ($)
+            <input type="number" id="autoArbMaxStake" value="50" min="1" max="10000" step="1">
+          </label>
+          <label class="arb-cfg-label" title="Sell both legs when current prices sum to this value (default 1.00 = 100%)">Exit at ≥
+            <input type="number" id="autoArbExitThreshold" value="1.00" min="0.90" max="1.50" step="0.01">
+          </label>
+          <div class="arb-engine-action-row">
+            <button type="button" class="auth-btn" id="autoArbStartBtn">▶ Start</button>
+            <button type="button" class="auth-btn auth-btn-outline" id="autoArbStopBtn" disabled>■ Stop</button>
+            <span id="autoArbStatusBadge" class="arb-status-badge">Stopped</span>
+            <span id="autoArbWsBadge" class="arb-ws-badge"></span>
+          </div>
+        </div>
+
+        <!-- Sim balance bar -->
+        <div id="autoArbSimBalanceBar" class="arb-sim-balance-bar" hidden>
+          <div class="arb-sim-bal-item">
+            <span class="arb-sim-bal-label">Poly balance</span>
+            <span class="arb-sim-bal-val" id="autoArbSimPolyBal">$1,000.00</span>
+          </div>
+          <div class="arb-sim-bal-item">
+            <span class="arb-sim-bal-label">Kalshi balance</span>
+            <span class="arb-sim-bal-val" id="autoArbSimKalBal">$1,000.00</span>
+          </div>
+        </div>
+
+        <!-- Portfolio summary bar (shown when positions exist) -->
+        <div id="autoArbPortfolioBar" class="arb-portfolio-bar" hidden>
+          <div class="arb-port-item">
+            <span class="arb-port-label">Positions</span>
+            <strong id="arbPortCnt">0</strong>
+          </div>
+          <div class="arb-port-item">
+            <span class="arb-port-label">Deployed</span>
+            <strong id="arbPortDeployed">$0.00</strong>
+          </div>
+          <div class="arb-port-item profit">
+            <span class="arb-port-label">Unrealized</span>
+            <strong id="arbPortUnrealized">+$0.00</strong>
+          </div>
+          <div class="arb-port-item profit">
+            <span class="arb-port-label">Realized</span>
+            <strong id="arbPortRealized">+$0.00</strong>
+          </div>
+          <div class="arb-port-item">
+            <span class="arb-port-label">Failed</span>
+            <strong id="arbPortFailed">0</strong>
+          </div>
+        </div>
+
+        <!-- Open positions grid -->
+        <div id="autoArbPositionsWrap" hidden>
+          <p class="arb-section-label">Open positions</p>
+          <div id="autoArbPositionsGrid" class="arb-positions-grid"></div>
+        </div>
+
+        <!-- Collapsible activity log -->
+        <details class="arb-feed-details">
+          <summary class="arb-feed-summary">Activity log</summary>
+          <div class="engine-feed" id="autoArbFeed"></div>
+        </details>
+
+      </section>
       <section class="arb-panel" id="arbPanel">
         <h3 class="arb-title">Arb opportunities</h3>
         <p class="arb-hint">Find risk-free arbitrage between Polymarket and Kalshi (NBA moneyline). Auto-refreshes every 0.5s. Sign in to both to place.</p>

@@ -480,6 +480,265 @@ async function stopEngine() {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Auto-Arb Engine UI ────────────────────────────────────────────────────────
+let autoArbRunning = false;
+let autoArbSimulate = true; // default to simulation
+let autoArbSSE = null;
+let autoArbFeed = [];
+let autoArbStats = { placed: 0, failed: 0, totalProfitUsd: 0 };
+let autoArbSimBalancePoly = 1000;
+let autoArbSimBalanceKal = 1000;
+let autoArbPositions = []; // positions placed in current session
+let autoArbRealizedPnl   = 0;
+let autoArbUnrealizedPnl = 0;
+
+function fmtTime(ts) {
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderArbPosCard(pos) {
+  const isHomePoly = (pos.strategyLabel || '').includes('Home');
+  const polyTeam  = isHomePoly ? pos.homeTeam : pos.awayTeam;
+  const kalTeam   = isHomePoly ? pos.awayTeam : pos.homeTeam;
+  const polyPrice = pos.polyPrice != null ? Math.round(pos.polyPrice * 100) + '¢' : '–';
+  const kalPrice  = pos.kalshiYesPriceCents != null ? pos.kalshiYesPriceCents + '¢' : '–';
+  const badge     = pos.simulate
+    ? '<span class="arb-pos-badge sim">SIM</span>'
+    : '<span class="arb-pos-badge live">LIVE</span>';
+
+  let footer;
+  if (pos.closed) {
+    const expected = pos.netProfitUsd != null ? `+$${Number(pos.netProfitUsd).toFixed(2)}` : '–';
+    const actual   = pos.actualProfitUsd != null ? `+$${Number(pos.actualProfitUsd).toFixed(2)}` : '–';
+    const exitPoly = pos.exitPolyPrice != null ? Math.round(pos.exitPolyPrice * 100) + '¢' : '–';
+    const exitKal  = pos.exitKalshiCents != null ? pos.exitKalshiCents + '¢' : '–';
+    footer = `
+      <div class="arb-pos-footer arb-pos-footer--closed">
+        <div class="arb-pos-profit-block">
+          <span class="arb-pos-profit-label">Expected</span>
+          <span class="arb-pos-profit">${expected}</span>
+        </div>
+        <div class="arb-pos-profit-block">
+          <span class="arb-pos-profit-label">Actual</span>
+          <span class="arb-pos-profit arb-pos-profit--actual">${actual}</span>
+        </div>
+        <span class="arb-pos-status--closed">Closed early ✓ · ${exitPoly} / ${exitKal}</span>
+      </div>`;
+  } else {
+    const profit = pos.netProfitUsd != null ? `+$${Number(pos.netProfitUsd).toFixed(2)}` : '';
+    footer = `
+      <div class="arb-pos-footer">
+        <span class="arb-pos-profit">${profit} expected</span>
+        <span class="arb-pos-status"><span class="arb-pos-pending-dot"></span>Pending payout</span>
+      </div>`;
+  }
+
+  return `
+    <div class="arb-pos-card${pos.closed ? ' arb-pos-card--closed' : ''}">
+      <div class="arb-pos-header">
+        <span class="arb-pos-matchup">${escapeHtml(pos.awayTeam)} @ ${escapeHtml(pos.homeTeam)}</span>
+        <div class="arb-pos-meta">${badge}<span class="arb-pos-time">${fmtTime(pos.placedAt || pos.ts)}</span></div>
+      </div>
+      <div class="arb-pos-legs">
+        <div class="arb-pos-leg">
+          <div class="arb-pos-leg-platform poly">Polymarket</div>
+          <div class="arb-pos-leg-team">${escapeHtml(polyTeam)} YES</div>
+          <div class="arb-pos-leg-price">${polyPrice} · $${Number(pos.stakePolyUsd).toFixed(2)}</div>
+          <div class="arb-pos-leg-id">${escapeHtml(pos.polyOrderId || '')}</div>
+        </div>
+        <div class="arb-pos-leg">
+          <div class="arb-pos-leg-platform kalshi">Kalshi</div>
+          <div class="arb-pos-leg-team">${escapeHtml(kalTeam)} YES</div>
+          <div class="arb-pos-leg-price">${kalPrice} · $${Number(pos.stakeKalshiUsd).toFixed(2)}</div>
+          <div class="arb-pos-leg-id">${escapeHtml(pos.kalshiOrderId || '')}</div>
+        </div>
+      </div>
+      ${footer}
+    </div>`;
+}
+
+function updateAutoArbUI() {
+  const startBtn = document.getElementById('autoArbStartBtn');
+  const stopBtn  = document.getElementById('autoArbStopBtn');
+  const badge    = document.getElementById('autoArbStatusBadge');
+  if (!startBtn) return;
+  startBtn.disabled = autoArbRunning;
+  stopBtn.disabled  = !autoArbRunning;
+
+  // Status badge
+  if (badge) {
+    const simTag = autoArbSimulate ? ' <span style="color:#f5a623;font-size:11px;font-weight:700">[SIM]</span>' : '';
+    badge.innerHTML    = autoArbRunning ? `🟢 Running${simTag}` : '⚫ Stopped';
+    badge.style.color  = autoArbRunning ? '#22c55e' : 'var(--text-muted)';
+  }
+
+  // Sim balance bar
+  const simBar = document.getElementById('autoArbSimBalanceBar');
+  if (simBar) {
+    simBar.hidden = !(autoArbSimulate && autoArbRunning);
+    if (!simBar.hidden) {
+      document.getElementById('autoArbSimPolyBal').textContent = '$' + autoArbSimBalancePoly.toFixed(2);
+      document.getElementById('autoArbSimKalBal').textContent  = '$' + autoArbSimBalanceKal.toFixed(2);
+    }
+  }
+
+  // Portfolio bar
+  const portBar = document.getElementById('autoArbPortfolioBar');
+  if (portBar) {
+    portBar.hidden = autoArbPositions.length === 0 && autoArbStats.placed === 0;
+    if (!portBar.hidden) {
+      const openPositions = autoArbPositions.filter(p => !p.closed);
+      const totalDeployed = openPositions.reduce((s, p) => s + (p.stakePolyUsd || 0) + (p.stakeKalshiUsd || 0), 0);
+      document.getElementById('arbPortCnt').textContent         = autoArbPositions.length;
+      document.getElementById('arbPortDeployed').textContent    = '$' + totalDeployed.toFixed(2);
+      document.getElementById('arbPortUnrealized').textContent  = '+$' + autoArbUnrealizedPnl.toFixed(2);
+      document.getElementById('arbPortRealized').textContent    = '+$' + autoArbRealizedPnl.toFixed(2);
+      document.getElementById('arbPortFailed').textContent      = autoArbStats.failed;
+    }
+  }
+
+  // Positions grid
+  const posWrap = document.getElementById('autoArbPositionsWrap');
+  const posGrid = document.getElementById('autoArbPositionsGrid');
+  if (posWrap && posGrid) {
+    posWrap.hidden = autoArbPositions.length === 0;
+    if (!posWrap.hidden) {
+      posGrid.innerHTML = autoArbPositions.map(renderArbPosCard).join('');
+    }
+  }
+
+  // Activity log
+  const feedEl = document.getElementById('autoArbFeed');
+  if (feedEl) {
+    feedEl.innerHTML = autoArbFeed.slice(0, 60).map(ev => {
+      const t = fmtTime(ev.ts);
+      const s = ev.simulate ? '[SIM] ' : '';
+      if (ev.type === 'placed')      return `<div class="engine-feed-item success">[${t}] ${s}✓ ${ev.strategyLabel} — +$${ev.netProfitUsd} expected</div>`;
+      if (ev.type === 'attempting')  return `<div class="engine-feed-item">[${t}] ${s}→ ${ev.strategyLabel} (+$${ev.netProfitUsd} expected)</div>`;
+      if (ev.type === 'failed')      return `<div class="engine-feed-item error">[${t}] ${s}✗ ${ev.gameKey || ''} — ${ev.error}${ev.leg1Done ? ' (⚠ Poly filled, Kalshi failed)' : ''}</div>`;
+      if (ev.type === 'exited')      return `<div class="engine-feed-item success">[${t}] ${s}✓ EXIT ${ev.strategyLabel} — actual +$${ev.actualProfitUsd}</div>`;
+      if (ev.type === 'exit_failed') return `<div class="engine-feed-item error">[${t}] ${s}✗ Exit failed ${ev.gameKey || ''} — ${ev.error}</div>`;
+      if (ev.type === 'started')     return `<div class="engine-feed-item">[${t}] Engine started (${ev.simulate ? 'SIMULATION' : 'REAL MONEY'})</div>`;
+      if (ev.type === 'stopped')     return `<div class="engine-feed-item">[${t}] Engine stopped</div>`;
+      return '';
+    }).filter(Boolean).join('');
+  }
+}
+
+function updateAutoArbWSBadge(wsPolyConnected, wsKalshiConnected) {
+  const el = document.getElementById('autoArbWsBadge');
+  if (!el) return;
+  const polyDot = wsPolyConnected ? '🟢' : '🔴';
+  const kalDot = wsKalshiConnected ? '🟢' : '🔴';
+  el.textContent = `WS: Poly ${polyDot}  Kalshi ${kalDot}`;
+}
+
+function openAutoArbSSE() {
+  if (autoArbSSE) { autoArbSSE.close(); autoArbSSE = null; }
+  autoArbSSE = new EventSource('/api/arb/auto/stream');
+  autoArbSSE.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      if (ev.stats) autoArbStats = ev.stats;
+      if (ev.simulate !== undefined) autoArbSimulate = ev.simulate;
+      if (ev.simBalancePoly !== undefined) autoArbSimBalancePoly = ev.simBalancePoly;
+      if (ev.simBalanceKal  !== undefined) autoArbSimBalanceKal  = ev.simBalanceKal;
+      if (ev.wsPolyConnected !== undefined) updateAutoArbWSBadge(ev.wsPolyConnected, ev.wsKalshiConnected);
+
+      if (ev.type === 'placed') {
+        autoArbPositions.unshift({ ...ev, placedAt: ev.ts || Date.now(), closed: false });
+        autoArbUnrealizedPnl = Math.round((autoArbUnrealizedPnl + (ev.netProfitUsd || 0)) * 100) / 100;
+      }
+
+      if (ev.type === 'exited') {
+        const idx = autoArbPositions.findIndex(p => p.positionId === ev.positionId);
+        if (idx !== -1) {
+          const pos = autoArbPositions[idx];
+          autoArbUnrealizedPnl = Math.round((autoArbUnrealizedPnl - (pos.netProfitUsd || 0)) * 100) / 100;
+          autoArbPositions[idx] = {
+            ...pos, closed: true, closedAt: ev.ts || Date.now(),
+            exitPolyPrice: ev.exitPolyPrice,
+            exitKalshiCents: ev.exitKalshiCents,
+            actualProfitUsd: ev.actualProfitUsd,
+          };
+        }
+        autoArbRealizedPnl = Math.round((autoArbRealizedPnl + (ev.actualProfitUsd || 0)) * 100) / 100;
+      }
+
+      if (ev.type === 'stopped') {
+        autoArbRunning = false;
+        autoArbRealizedPnl   = 0;
+        autoArbUnrealizedPnl = 0;
+        if (autoArbSSE) { autoArbSSE.close(); autoArbSSE = null; }
+      }
+
+      if (ev.type !== 'state') autoArbFeed.unshift(ev);
+      if (autoArbFeed.length > 100) autoArbFeed.pop();
+      updateAutoArbUI();
+    } catch (_) {}
+  };
+  autoArbSSE.onerror = () => {
+    if (!autoArbRunning) { if (autoArbSSE) { autoArbSSE.close(); autoArbSSE = null; } }
+  };
+}
+
+async function startAutoArb() {
+  const isSim = document.getElementById('autoArbModeSim')?.checked ?? true;
+  if (!isSim) {
+    if (!authState.polymarket) { alert('Sign in to Polymarket first for real money mode.'); return; }
+    if (!authState.kalshi) { alert('Sign in to Kalshi first for real money mode.'); return; }
+  }
+  const simBalancePoly = parseFloat(document.getElementById('autoArbSimPoly')?.value) || 1000;
+  const simBalanceKal  = parseFloat(document.getElementById('autoArbSimKal')?.value)  || 1000;
+  const maxStakeUsd    = parseFloat(document.getElementById('autoArbMaxStake')?.value) || 50;
+  const exitThreshold  = parseFloat(document.getElementById('autoArbExitThreshold')?.value) || 1.00;
+  try {
+    const res = await fetch(`${API_BASE}/api/arb/auto/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ simulate: isSim, simBalancePoly, simBalanceKal, maxStakeUsd, exitThreshold }),
+    });
+    const data = await res.json();
+    if (!res.ok) { alert(data.error || 'Failed to start auto-arb'); return; }
+    autoArbRunning = true;
+    autoArbSimulate = isSim;
+    autoArbSimBalancePoly = simBalancePoly;
+    autoArbSimBalanceKal  = simBalanceKal;
+    autoArbFeed = [];
+    autoArbStats = { placed: 0, failed: 0, totalProfitUsd: 0 };
+    autoArbPositions = [];
+    autoArbRealizedPnl   = 0;
+    autoArbUnrealizedPnl = 0;
+    openAutoArbSSE();
+    updateAutoArbUI();
+    setTimeout(refreshAutoArbWSStatus, 2000);
+  } catch (err) {
+    alert('Auto-arb start failed: ' + err.message);
+  }
+}
+
+async function stopAutoArb() {
+  try {
+    await fetch(`${API_BASE}/api/arb/auto/stop`, { method: 'POST', credentials: 'include' });
+  } catch (_) {}
+  autoArbRunning = false;
+  if (autoArbSSE) { autoArbSSE.close(); autoArbSSE = null; }
+  updateAutoArbUI();
+}
+
+async function refreshAutoArbWSStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/api/arb/auto/status`, { credentials: 'include' });
+    if (res.ok) {
+      const data = await res.json();
+      updateAutoArbWSBadge(data.wsPolyConnected, data.wsKalshiConnected);
+    }
+  } catch (_) {}
+  if (autoArbRunning) setTimeout(refreshAutoArbWSStatus, 5000);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function fetchArbOpportunities(silent = false) {
   if (arbFetchInFlight) {
     if (!silent) arbPendingManualCheck = true;
@@ -1066,13 +1325,22 @@ function renderArbHistory() {
     return;
   }
   el.innerHTML = arbHistory.map((h) => {
-    const date = new Date(h.placedAt).toLocaleString();
-    const profit = h.netProfitUsd != null ? `+$${h.netProfitUsd}` : '';
+    const date    = new Date(h.placedAt).toLocaleString();
+    const profit  = h.netProfitUsd != null ? `+$${h.netProfitUsd}` : '';
+    const isEarly = h.status === 'closed-early';
+    const statusBadge = isEarly
+      ? ' <span style="color:#22c55e;font-size:11px;font-weight:700">· Closed early ✓</span>' : '';
+    const actualLine = isEarly && h.actualProfitUsd != null
+      ? `<div class="order-detail" style="color:#22c55e">Actual profit: +$${h.actualProfitUsd}` +
+        (h.exitPolyPrice != null
+          ? ` <span style="color:var(--text-muted);font-size:11px">(exit ${Math.round(h.exitPolyPrice*100)}¢ / ${h.exitKalshiCents}¢)</span>` : '') +
+        `</div>` : '';
     return `<div class="dashboard-order-card poly" style="margin-bottom:8px">
-      <div class="order-game">${escapeHtml(h.awayTeam || '')} @ ${escapeHtml(h.homeTeam || '')}</div>
+      <div class="order-game">${escapeHtml(h.awayTeam || '')} @ ${escapeHtml(h.homeTeam || '')}${statusBadge}</div>
       <div class="order-detail">${escapeHtml(h.strategyLabel || '')} · Poly $${h.stakePolyUsd} · Kalshi $${h.stakeKalshiUsd}</div>
-      <div class="order-detail" style="color:var(--green)">${profit} expected profit</div>
-      <div class="order-detail" style="color:var(--muted);font-size:11px">${date}</div>
+      <div class="order-detail" style="color:var(--text-muted)">${profit} expected profit</div>
+      ${actualLine}
+      <div class="order-detail" style="color:var(--text-muted);font-size:11px">${date}</div>
     </div>`;
   }).join('');
 }
@@ -1813,6 +2081,17 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
   const engineStopBtn = document.getElementById('engineStopBtn');
   if (engineStartBtn) engineStartBtn.addEventListener('click', startEngine);
   if (engineStopBtn) engineStopBtn.addEventListener('click', stopEngine);
+  const autoArbStartBtn = document.getElementById('autoArbStartBtn');
+  const autoArbStopBtn = document.getElementById('autoArbStopBtn');
+  if (autoArbStartBtn) autoArbStartBtn.addEventListener('click', startAutoArb);
+  if (autoArbStopBtn) autoArbStopBtn.addEventListener('click', stopAutoArb);
+  // Show/hide sim config based on mode selection
+  const simCfg = document.getElementById('autoArbSimConfig');
+  document.querySelectorAll('input[name="autoArbMode"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      if (simCfg) simCfg.style.display = radio.value === 'sim' && radio.checked ? 'flex' : (document.getElementById('autoArbModeSim')?.checked ? 'flex' : 'none');
+    });
+  });
   const simBalancesEl = document.getElementById('simBalances');
   if (simBalancesEl && !simRunning) simBalancesEl.textContent = `Poly $${SIM_INITIAL_POLY}  ·  Kalshi $${SIM_INITIAL_KAL}  ·  Total $${SIM_INITIAL_POLY + SIM_INITIAL_KAL} (initial)`;
 })();

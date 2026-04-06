@@ -6,6 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import fs from 'fs';
+import WebSocket from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -82,6 +83,14 @@ function appendArbHistory(entry) {
   history.unshift(entry); // newest first
   if (history.length > 200) history.splice(200);
   writeArbHistory(history);
+}
+function updateArbHistoryEntry(id, fields) {
+  const history = readArbHistory();
+  const idx = history.findIndex(h => h.id === id);
+  if (idx === -1) return false;
+  Object.assign(history[idx], fields);
+  writeArbHistory(history);
+  return true;
 }
 
 app.get('/api/arb-history', (req, res) => res.json(readArbHistory()));
@@ -479,7 +488,156 @@ let polymarketCache = null;
 let polymarketCacheTime = 0;
 // Call this whenever you need to force a fresh fetch (e.g. after a bug fix)
 function bustPolymarketCache() { polymarketCache = null; polymarketCacheTime = 0; }
-const POLYMARKET_CACHE_TTL_MS = 10000; // 10 seconds — keep odds fresh for live games
+const POLYMARKET_CACHE_TTL_MS = 10000; // 10 seconds — used when WS is not connected
+
+// ── WebSocket Price Feeds ─────────────────────────────────────────────────────
+// Game objects are discovered via REST; prices stay fresh via WebSocket push.
+
+const polyGamesState = new Map();   // gameKey → game object (prices updated by WS)
+const kalshiGamesState = new Map(); // gameKey → game object (prices updated by WS)
+const polyTokenToKey = new Map();   // tokenId → gameKey
+const kalshiTickerToKey = new Map(); // marketTicker → gameKey
+const subscribedPolyTokenIds = new Set();
+const subscribedKalshiTickers = new Set();
+
+// ─── Polymarket WebSocket ─────────────────────────────────────────────────────
+let polyWs = null;
+let polyWsPingInterval = null;
+
+function connectPolymarketWS() {
+  if (polyWs && (polyWs.readyState === 0 || polyWs.readyState === 1)) return;
+  try {
+    polyWs = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
+    polyWs.on('open', () => {
+      console.log('[PolyWS] Connected');
+      if (subscribedPolyTokenIds.size) {
+        polyWs.send(JSON.stringify({ assets_ids: [...subscribedPolyTokenIds], type: 'market' }));
+      }
+      clearInterval(polyWsPingInterval);
+      polyWsPingInterval = setInterval(() => {
+        if (polyWs?.readyState === 1) polyWs.send('PING');
+      }, 10000);
+    });
+    polyWs.on('message', (raw) => {
+      try {
+        const text = raw.toString();
+        if (text === 'PONG') return;
+        const msgs = JSON.parse(text);
+        const arr = Array.isArray(msgs) ? msgs : [msgs];
+        for (const msg of arr) {
+          const tokenId = String(msg.asset_id || '');
+          if (!tokenId) continue;
+          const key = polyTokenToKey.get(tokenId);
+          if (!key) continue;
+          const game = polyGamesState.get(key);
+          if (!game) continue;
+          let bestBid = null;
+          if (msg.event_type === 'book' && Array.isArray(msg.bids) && msg.bids.length > 0) {
+            bestBid = parseFloat(msg.bids[0].price);
+          } else if (msg.event_type === 'price_change' && Array.isArray(msg.changes)) {
+            const buys = msg.changes.filter(c => c.side === 'BUY' && parseFloat(c.size) > 0)
+              .sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+            if (buys.length) bestBid = parseFloat(buys[0].price);
+          } else if (msg.event_type === 'last_trade_price' && msg.price) {
+            bestBid = parseFloat(msg.price);
+          }
+          if (bestBid !== null && !isNaN(bestBid) && bestBid > 0.01 && bestBid < 0.99) {
+            if (tokenId === String(game.tokenIdHome)) game.homeOdds = Math.round(bestBid * 100) / 100;
+            else if (tokenId === String(game.tokenIdAway)) game.awayOdds = Math.round(bestBid * 100) / 100;
+            game._wsUpdatedAt = Date.now();
+            onPriceUpdate();
+          }
+        }
+      } catch (_) {}
+    });
+    polyWs.on('close', () => {
+      clearInterval(polyWsPingInterval);
+      console.log('[PolyWS] Disconnected, reconnecting in 3s...');
+      setTimeout(connectPolymarketWS, 3000);
+    });
+    polyWs.on('error', (err) => console.error('[PolyWS] Error:', err.message));
+  } catch (err) {
+    console.error('[PolyWS] Failed to connect:', err.message);
+    setTimeout(connectPolymarketWS, 5000);
+  }
+}
+
+function subscribePolymarketTokens(tokenIds) {
+  const fresh = tokenIds.filter(id => id && !subscribedPolyTokenIds.has(id));
+  if (!fresh.length) return;
+  fresh.forEach(id => subscribedPolyTokenIds.add(id));
+  if (polyWs?.readyState === 1) polyWs.send(JSON.stringify({ assets_ids: fresh, type: 'market' }));
+}
+
+// ─── Kalshi WebSocket ─────────────────────────────────────────────────────────
+let kalshiWs = null;
+let kalshiWsCreds = null;
+let kalshiWsPingInterval = null;
+
+function connectKalshiWS(creds) {
+  if (!creds?.apiKeyId || !creds?.privateKey) return;
+  kalshiWsCreds = creds;
+  if (kalshiWs && (kalshiWs.readyState === 0 || kalshiWs.readyState === 1)) return;
+  try {
+    const ts = String(Date.now());
+    const wsPath = '/trade-api/ws/v2';
+    const sig = kalshiSign(creds.privateKey, ts, 'GET', wsPath);
+    kalshiWs = new WebSocket('wss://api.elections.kalshi.com/trade-api/ws/v2', {
+      headers: {
+        'KALSHI-ACCESS-KEY': creds.apiKeyId,
+        'KALSHI-ACCESS-TIMESTAMP': ts,
+        'KALSHI-ACCESS-SIGNATURE': sig,
+      },
+    });
+    kalshiWs.on('open', () => {
+      console.log('[KalshiWS] Connected');
+      if (subscribedKalshiTickers.size) {
+        kalshiWs.send(JSON.stringify({ id: 1, cmd: 'subscribe', params: { channels: ['ticker'], market_tickers: [...subscribedKalshiTickers] } }));
+      }
+      clearInterval(kalshiWsPingInterval);
+      kalshiWsPingInterval = setInterval(() => {
+        if (kalshiWs?.readyState === 1) kalshiWs.send(JSON.stringify({ id: 99, cmd: 'ping' }));
+      }, 20000);
+    });
+    kalshiWs.on('message', (raw) => {
+      try {
+        const data = JSON.parse(raw.toString());
+        if (data.type !== 'ticker' || !data.msg) return;
+        const { market_ticker, yes_bid, yes_ask } = data.msg;
+        if (!market_ticker) return;
+        const key = kalshiTickerToKey.get(market_ticker);
+        if (!key) return;
+        const game = kalshiGamesState.get(key);
+        if (!game) return;
+        const mid = (parseFloat(yes_bid) + parseFloat(yes_ask)) / 2 / 100; // cents → decimal
+        if (isNaN(mid) || mid < 0.01 || mid > 0.99) return;
+        if (market_ticker === game.marketTickerHome) game.homeOdds = Math.round(mid * 100) / 100;
+        else if (market_ticker === game.marketTickerAway) game.awayOdds = Math.round(mid * 100) / 100;
+        game._wsUpdatedAt = Date.now();
+        onPriceUpdate();
+      } catch (_) {}
+    });
+    kalshiWs.on('close', () => {
+      clearInterval(kalshiWsPingInterval);
+      console.log('[KalshiWS] Disconnected, reconnecting in 3s...');
+      setTimeout(() => connectKalshiWS(kalshiWsCreds), 3000);
+    });
+    kalshiWs.on('error', (err) => console.error('[KalshiWS] Error:', err.message));
+  } catch (err) {
+    console.error('[KalshiWS] Failed to connect:', err.message);
+    setTimeout(() => connectKalshiWS(kalshiWsCreds), 5000);
+  }
+}
+
+function subscribeKalshiTickers(tickers) {
+  const fresh = tickers.filter(t => t && !subscribedKalshiTickers.has(t));
+  if (!fresh.length) return;
+  fresh.forEach(t => subscribedKalshiTickers.add(t));
+  if (kalshiWs?.readyState === 1) {
+    kalshiWs.send(JSON.stringify({ id: 2, cmd: 'subscribe', params: { channels: ['ticker'], market_tickers: fresh } }));
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Fetch NBA game odds from Polymarket - look up each upcoming game by slug (tag_id=745 returns 422)
 app.get('/api/polymarket', async (req, res) => {
@@ -605,6 +763,17 @@ app.get('/api/polymarket', async (req, res) => {
     }
 
     const games = Array.from(byKey.values()).sort((a, b) => new Date(a.startDate || 0) - new Date(b.startDate || 0));
+
+    // Update in-memory state and subscribe WS to any new token IDs
+    const newTokenIds = [];
+    for (const game of games) {
+      const key = `${game.awayTeam}-${game.homeTeam}`;
+      polyGamesState.set(key, game);
+      if (game.tokenIdHome) { polyTokenToKey.set(String(game.tokenIdHome), key); if (!subscribedPolyTokenIds.has(String(game.tokenIdHome))) newTokenIds.push(String(game.tokenIdHome)); }
+      if (game.tokenIdAway) { polyTokenToKey.set(String(game.tokenIdAway), key); if (!subscribedPolyTokenIds.has(String(game.tokenIdAway))) newTokenIds.push(String(game.tokenIdAway)); }
+    }
+    if (newTokenIds.length) subscribePolymarketTokens(newTokenIds);
+
     const result = { games };
     polymarketCache = result;
     polymarketCacheTime = Date.now();
@@ -809,6 +978,16 @@ app.get('/api/kalshi', async (req, res) => {
       (a, b) => new Date(a.startDate || 0) - new Date(b.startDate || 0)
     );
 
+    // Update in-memory state and subscribe WS to any new tickers
+    const newTickers = [];
+    for (const game of games) {
+      const key = `${game.awayTeam}-${game.homeTeam}`;
+      kalshiGamesState.set(key, game);
+      if (game.marketTickerHome) { kalshiTickerToKey.set(game.marketTickerHome, key); if (!subscribedKalshiTickers.has(game.marketTickerHome)) newTickers.push(game.marketTickerHome); }
+      if (game.marketTickerAway) { kalshiTickerToKey.set(game.marketTickerAway, key); if (!subscribedKalshiTickers.has(game.marketTickerAway)) newTickers.push(game.marketTickerAway); }
+    }
+    if (newTickers.length) subscribeKalshiTickers(newTickers);
+
     res.json({ games });
   } catch (error) {
     console.error('Kalshi API error:', error.message);
@@ -942,6 +1121,345 @@ function detectValueOpportunities(polyGames, sharpOddsMap, minEdge = VALUE_MIN_E
   }
   return opportunities.sort((a, b) => b.edge - a.edge);
 }
+
+// ── Auto-Arb Engine ───────────────────────────────────────────────────────────
+
+// Direct Polymarket order placement — no req/res, takes credentials directly.
+async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price, size, tickSize = '0.01', negRisk = false, side = 'BUY') {
+  const { ClobClient, Side, OrderType, AssetType } = await import('@polymarket/clob-client');
+  const { Wallet } = await import('ethers');
+  const wallet = new Wallet(String(polyCreds.privateKey).trim());
+  const apiCreds = {
+    key: String(polyCreds.apiKey ?? '').trim(),
+    secret: String(polyCreds.secret ?? '').trim(),
+    passphrase: String(polyCreds.passphrase ?? '').trim(),
+  };
+  const funder = (polyFunder && /^0x[a-fA-F0-9]{40}$/.test(String(polyFunder)))
+    ? String(polyFunder).trim().toLowerCase()
+    : wallet.address.toLowerCase();
+  const isProxy = funder !== wallet.address.toLowerCase();
+  const tokenIdStr = normalizePolyTokenId(tokenId) || String(tokenId).trim();
+  const attempts = [
+    { sigType: 0, funderAddr: wallet.address },
+    ...(isProxy
+      ? [{ sigType: 1, funderAddr: funder }, { sigType: 2, funderAddr: funder }]
+      : [{ sigType: 1, funderAddr: wallet.address }, { sigType: 2, funderAddr: wallet.address }]),
+  ];
+  let lastErr = null;
+  for (const { sigType, funderAddr } of attempts) {
+    const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funderAddr);
+    try { await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL }); } catch (_) {}
+    let ts = tickSize;
+    try { const mt = await client.getTickSize(tokenIdStr); if (mt != null) ts = polyTickSizeSupported(String(mt)); } catch (_) {}
+    const priceRounded = roundPriceToTick(price, ts);
+    const sideVal = String(side).toUpperCase() === 'SELL' ? Side.SELL : Side.BUY;
+    const userOrder = { tokenID: tokenIdStr, price: priceRounded, size: Number(size), side: sideVal };
+    try {
+      const response = await client.createAndPostOrder(userOrder, { negRisk, tickSize: ts }, OrderType.GTC);
+      const responseErr = response?.error || response?.errorMsg;
+      if (responseErr) {
+        lastErr = new Error(String(responseErr));
+        if (/invalid signature/i.test(String(responseErr))) continue;
+        throw lastErr;
+      }
+      return response;
+    } catch (err) {
+      lastErr = err;
+      const errMsg = err?.response?.data?.error || err?.message || '';
+      if (err?.response?.status === 401 || err?.response?.status === 403 || /invalid signature/i.test(errMsg)) continue;
+      throw err;
+    }
+  }
+  throw lastErr || new Error('Polymarket order failed');
+}
+
+// Direct Kalshi order placement — no req/res, takes credentials directly.
+async function placeKalshiOrderDirect(kalshiCreds, ticker, side, count, yesPriceCents, action = 'buy') {
+  const path = '/trade-api/v2/portfolio/orders';
+  const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
+  const timestamp = String(Date.now());
+  const signature = kalshiSign(kalshiCreds.privateKey, timestamp, 'POST', path);
+  const body = {
+    ticker,
+    action: action,
+    side: side.toLowerCase() === 'yes' ? 'yes' : 'no',
+    count: Number(count),
+    type: 'limit',
+    yes_price: Math.min(99, Math.max(1, Math.round(Number(yesPriceCents)))),
+    client_order_id: crypto.randomUUID(),
+  };
+  const orderRes = await fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'KALSHI-ACCESS-KEY': kalshiCreds.apiKeyId,
+      'KALSHI-ACCESS-TIMESTAMP': timestamp,
+      'KALSHI-ACCESS-SIGNATURE': signature,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await orderRes.json().catch(() => ({}));
+  if (!orderRes.ok) {
+    const errMsg = typeof data.error === 'string' ? data.error : data.message || 'Kalshi order failed';
+    throw new Error(errMsg);
+  }
+  return data;
+}
+
+// Execute both legs of an arb. Used by manual /api/arb/execute AND auto-arb engine.
+async function executeArb(opp, credsPoly, credsKal, polyFunder) {
+  const stakePoly = Number(opp.stakePolyUsd) || 0;
+  const polyPrice = Number(opp.polyPrice) || 0.5;
+  const polySize = Math.max(1, Math.floor(stakePoly / Math.max(0.01, polyPrice)));
+  if (polySize * polyPrice < 1) throw new Error(`Stake too small: $${(polySize * polyPrice).toFixed(2)} (min $1 notional)`);
+
+  const polyResult = await placePolymarketOrderDirect(
+    credsPoly, polyFunder,
+    opp.polyTokenId, polyPrice, polySize,
+    opp.polyTickSize || '0.01', opp.polyNegRisk || false
+  );
+
+  let kalshiResult;
+  try {
+    kalshiResult = await placeKalshiOrderDirect(
+      credsKal, opp.kalshiTicker,
+      opp.kalshiSide || 'yes',
+      Math.max(1, Number(opp.kalshiCount) || 1),
+      Math.min(99, Math.max(1, Number(opp.kalshiYesPriceCents) || 50))
+    );
+  } catch (kalErr) {
+    throw Object.assign(kalErr, { leg1Done: true, polyResult });
+  }
+
+  const historyEntry = {
+    id: crypto.randomUUID(), placedAt: Date.now(),
+    gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+    strategyLabel: opp.strategyLabel,
+    stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
+    netProfitUsd: opp.netProfitUsd, polyPrice: opp.polyPrice,
+    kalshiYesPriceCents: opp.kalshiYesPriceCents,
+    polyOrderId: polyResult?.orderID || polyResult?.id || null,
+    kalshiOrderId: kalshiResult?.order?.order_id || kalshiResult?.id || null,
+    status: 'placed',
+  };
+  appendArbHistory(historyEntry);
+  autoArbEngine.openPositions.set(historyEntry.id, {
+    id: historyEntry.id,
+    gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+    strategyLabel: opp.strategyLabel, strategy: opp.strategy,
+    entryPolyPrice: opp.polyPrice, entryKalshiCents: opp.kalshiYesPriceCents,
+    polyShares: Math.max(1, Math.floor(opp.stakePolyUsd / opp.polyPrice)),
+    kalshiCount: opp.kalshiCount,
+    polyTokenId: opp.polyTokenId, polyTickSize: opp.polyTickSize || '0.01', polyNegRisk: opp.polyNegRisk || false,
+    kalshiTicker: opp.kalshiTicker, kalshiSide: opp.kalshiSide || 'yes',
+    stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
+    netProfitUsd: opp.netProfitUsd, simulate: false, placedAt: Date.now(),
+  });
+
+  return { poly: polyResult, kalshi: kalshiResult, positionId: historyEntry.id };
+}
+
+function executeArbSimulated(opp) {
+  if (autoArbEngine.simBalancePoly < opp.stakePolyUsd)
+    throw new Error(`Sim: insufficient Poly balance ($${autoArbEngine.simBalancePoly.toFixed(2)})`);
+  if (autoArbEngine.simBalanceKal < opp.stakeKalshiUsd)
+    throw new Error(`Sim: insufficient Kalshi balance ($${autoArbEngine.simBalanceKal.toFixed(2)})`);
+  autoArbEngine.simBalancePoly = Math.round((autoArbEngine.simBalancePoly - opp.stakePolyUsd) * 100) / 100;
+  autoArbEngine.simBalanceKal  = Math.round((autoArbEngine.simBalanceKal  - opp.stakeKalshiUsd) * 100) / 100;
+  const positionId    = crypto.randomUUID();
+  const polyOrderId   = 'SIM-' + crypto.randomUUID().slice(0, 8);
+  const kalshiOrderId = 'SIM-' + crypto.randomUUID().slice(0, 8);
+  appendArbHistory({
+    id: positionId, placedAt: Date.now(),
+    gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+    strategyLabel: opp.strategyLabel,
+    stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
+    netProfitUsd: opp.netProfitUsd, polyPrice: opp.polyPrice,
+    kalshiYesPriceCents: opp.kalshiYesPriceCents,
+    polyOrderId, kalshiOrderId,
+    status: 'simulated',
+  });
+  autoArbEngine.openPositions.set(positionId, {
+    id: positionId,
+    gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+    strategyLabel: opp.strategyLabel, strategy: opp.strategy,
+    entryPolyPrice: opp.polyPrice, entryKalshiCents: opp.kalshiYesPriceCents,
+    polyShares: Math.max(1, Math.floor(opp.stakePolyUsd / opp.polyPrice)),
+    kalshiCount: opp.kalshiCount,
+    polyTokenId: opp.polyTokenId, polyTickSize: opp.polyTickSize || '0.01', polyNegRisk: opp.polyNegRisk || false,
+    kalshiTicker: opp.kalshiTicker, kalshiSide: opp.kalshiSide || 'yes',
+    stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
+    netProfitUsd: opp.netProfitUsd, simulate: true, placedAt: Date.now(),
+  });
+  return { positionId, polyOrderId, kalshiOrderId };
+}
+
+const autoArbEngine = {
+  running: false,
+  simulate: false,
+  simBalancePoly: 1000,
+  simBalanceKal: 1000,
+  maxStakeUsd: ARB_MAX_STAKE_USD,
+  credsPoly: null,
+  credsKal: null,
+  polyFunder: null,
+  cooldowns: new Map(),   // gameKey → lastPlacedAt ms
+  cooldownMs: 60000,
+  sseClients: new Set(),
+  stats: { placed: 0, failed: 0, totalProfitUsd: 0 },
+  startedAt: null,
+  _priceUpdatePending: false,
+  openPositions: new Map(),   // positionId → position object
+  exitThreshold: 1.00,        // sell both legs when currentPolyPrice + currentKalshiPrice >= this
+  _exitCheckPending: false,
+  _exitIntervalId: null,      // fallback 10s polling interval
+};
+
+function broadcastAutoArbEvent(type, data) {
+  const payload = `data: ${JSON.stringify({ type, ...data, ts: Date.now() })}\n\n`;
+  for (const client of autoArbEngine.sseClients) {
+    try { client.write(payload); } catch (_) { autoArbEngine.sseClients.delete(client); }
+  }
+}
+
+// Called on every WS price update. Debounced to max once per 200ms.
+function onPriceUpdate() {
+  if (!autoArbEngine.running) return;
+  if (!autoArbEngine._priceUpdatePending) {
+    autoArbEngine._priceUpdatePending = true;
+    setTimeout(runAutoArbCheck, 200);
+  }
+  if (!autoArbEngine._exitCheckPending) {
+    autoArbEngine._exitCheckPending = true;
+    setTimeout(async () => {
+      autoArbEngine._exitCheckPending = false;
+      await checkEarlyExits();
+    }, 200);
+  }
+}
+
+async function runAutoArbCheck() {
+  autoArbEngine._priceUpdatePending = false;
+  if (!autoArbEngine.running) return;
+  const polyGames = [...polyGamesState.values()].filter(g => g.tokenIdHome && g.tokenIdAway);
+  const kalshiGames = [...kalshiGamesState.values()];
+  if (!polyGames.length || !kalshiGames.length) return;
+  const opps = detectArbOpportunities(polyGames, kalshiGames, null, autoArbEngine.maxStakeUsd);
+  for (const opp of opps) {
+    const lastPlaced = autoArbEngine.cooldowns.get(opp.gameKey);
+    if (lastPlaced && Date.now() - lastPlaced < autoArbEngine.cooldownMs) continue;
+    autoArbEngine.cooldowns.set(opp.gameKey, Date.now());
+    broadcastAutoArbEvent('attempting', { gameKey: opp.gameKey, strategyLabel: opp.strategyLabel, netProfitUsd: opp.netProfitUsd, simulate: autoArbEngine.simulate });
+    try {
+      let orderIds = { polyOrderId: null, kalshiOrderId: null, positionId: null };
+      if (autoArbEngine.simulate) {
+        const r = executeArbSimulated(opp);
+        orderIds.polyOrderId   = r.polyOrderId;
+        orderIds.kalshiOrderId = r.kalshiOrderId;
+        orderIds.positionId    = r.positionId;
+      } else {
+        const r = await executeArb(opp, autoArbEngine.credsPoly, autoArbEngine.credsKal, autoArbEngine.polyFunder);
+        orderIds.polyOrderId   = r?.poly?.orderID || r?.poly?.id || null;
+        orderIds.kalshiOrderId = r?.kalshi?.order?.order_id || r?.kalshi?.id || null;
+        orderIds.positionId    = r?.positionId || null;
+      }
+      autoArbEngine.stats.placed++;
+      autoArbEngine.stats.totalProfitUsd = Math.round((autoArbEngine.stats.totalProfitUsd + opp.netProfitUsd) * 100) / 100;
+      broadcastAutoArbEvent('placed', {
+        positionId: orderIds.positionId,
+        gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+        strategyLabel: opp.strategyLabel, netProfitUsd: opp.netProfitUsd,
+        stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
+        polyPrice: opp.polyPrice, kalshiYesPriceCents: opp.kalshiYesPriceCents,
+        polyOrderId: orderIds.polyOrderId, kalshiOrderId: orderIds.kalshiOrderId,
+        simulate: autoArbEngine.simulate,
+        simBalancePoly: autoArbEngine.simBalancePoly,
+        simBalanceKal: autoArbEngine.simBalanceKal,
+        stats: autoArbEngine.stats,
+      });
+      console.log(`[AutoArb${autoArbEngine.simulate ? ' SIM' : ''}] Placed: ${opp.strategyLabel} +$${opp.netProfitUsd}`);
+    } catch (err) {
+      autoArbEngine.stats.failed++;
+      broadcastAutoArbEvent('failed', { gameKey: opp.gameKey, error: err.message, leg1Done: err.leg1Done || false, simulate: autoArbEngine.simulate });
+      console.error('[AutoArb] Failed:', err.message);
+    }
+    break; // one arb per price-update cycle to avoid over-trading
+  }
+}
+
+async function checkEarlyExits() {
+  if (!autoArbEngine.running || autoArbEngine.openPositions.size === 0) return;
+  for (const [positionId, pos] of autoArbEngine.openPositions) {
+    const polyGame   = polyGamesState.get(pos.gameKey);
+    const kalshiGame = kalshiGamesState.get(pos.gameKey);
+    if (!polyGame || !kalshiGame) continue;
+
+    // strategy 1 = Home on Poly + Away on Kalshi; strategy 2 = Away on Poly + Home on Kalshi
+    const currentPolyPrice   = pos.strategy === 1
+      ? (polyGame.homeOdds   ?? pos.entryPolyPrice)
+      : (polyGame.awayOdds   ?? pos.entryPolyPrice);
+    const currentKalshiPrice = pos.strategy === 1
+      ? (kalshiGame.awayOdds ?? (pos.entryKalshiCents / 100))
+      : (kalshiGame.homeOdds ?? (pos.entryKalshiCents / 100));
+
+    if (currentPolyPrice + currentKalshiPrice < autoArbEngine.exitThreshold) continue;
+
+    // Delete immediately to prevent double-exit on the next WS tick
+    autoArbEngine.openPositions.delete(positionId);
+
+    const exitPolyPrice   = Math.round(currentPolyPrice * 100) / 100;
+    const exitKalshiCents = Math.round(currentKalshiPrice * 100);
+    const actualProfitUsd = Math.round(
+      ((exitPolyPrice - pos.entryPolyPrice) * pos.polyShares +
+       (exitKalshiCents - pos.entryKalshiCents) / 100 * pos.kalshiCount) * 100
+    ) / 100;
+
+    try {
+      if (pos.simulate) {
+        autoArbEngine.simBalancePoly = Math.round(
+          (autoArbEngine.simBalancePoly + pos.stakePolyUsd + (exitPolyPrice - pos.entryPolyPrice) * pos.polyShares) * 100
+        ) / 100;
+        autoArbEngine.simBalanceKal = Math.round(
+          (autoArbEngine.simBalanceKal + pos.stakeKalshiUsd + (exitKalshiCents - pos.entryKalshiCents) / 100 * pos.kalshiCount) * 100
+        ) / 100;
+      } else {
+        await placePolymarketOrderDirect(
+          autoArbEngine.credsPoly, autoArbEngine.polyFunder,
+          pos.polyTokenId, exitPolyPrice, pos.polyShares,
+          pos.polyTickSize, pos.polyNegRisk, 'SELL'
+        );
+        await placeKalshiOrderDirect(
+          autoArbEngine.credsKal, pos.kalshiTicker, pos.kalshiSide || 'yes',
+          pos.kalshiCount, exitKalshiCents, 'sell'
+        );
+      }
+
+      autoArbEngine.stats.totalProfitUsd = Math.round((autoArbEngine.stats.totalProfitUsd + actualProfitUsd) * 100) / 100;
+      updateArbHistoryEntry(positionId, {
+        status: 'closed-early', closedAt: Date.now(),
+        exitPolyPrice, exitKalshiCents, actualProfitUsd,
+      });
+      broadcastAutoArbEvent('exited', {
+        positionId,
+        gameKey: pos.gameKey, awayTeam: pos.awayTeam, homeTeam: pos.homeTeam,
+        strategyLabel: pos.strategyLabel,
+        exitPolyPrice, exitKalshiCents, actualProfitUsd,
+        simulate: pos.simulate,
+        simBalancePoly: autoArbEngine.simBalancePoly,
+        simBalanceKal:  autoArbEngine.simBalanceKal,
+        stats: autoArbEngine.stats,
+      });
+      console.log(`[AutoArb${pos.simulate ? ' SIM' : ''}] Early exit: ${pos.strategyLabel} actual=$${actualProfitUsd}`);
+    } catch (err) {
+      autoArbEngine.openPositions.set(positionId, pos); // re-insert to retry next tick
+      broadcastAutoArbEvent('exit_failed', {
+        positionId, gameKey: pos.gameKey, error: err.message, simulate: pos.simulate,
+      });
+      console.error('[AutoArb] Early exit failed:', err.message);
+    }
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Live Arb Engine ──────────────────────────────────────────────────────────
 const arbEngine = {
@@ -1115,32 +1633,6 @@ async function placePolyOrderDirect(creds, funder, { tokenId, side, price, size,
   return { error: lastErr?.message || 'All signature attempts failed' };
 }
 
-async function placeKalshiOrderDirect(creds, { ticker, side, count, yes_price, client_order_id }) {
-  const path = '/trade-api/v2/portfolio/orders';
-  const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
-  const timestamp = String(Date.now());
-  const signature = kalshiSign(creds.privateKey, timestamp, 'POST', path);
-  const body = {
-    ticker, action: 'buy',
-    side: side.toLowerCase() === 'yes' ? 'yes' : 'no',
-    count: Number(count), type: 'limit',
-    yes_price: Math.min(99, Math.max(1, Math.round(Number(yes_price ?? 50)))),
-    client_order_id: client_order_id || crypto.randomUUID(),
-  };
-  const res = await fetch(`${baseUrl}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'KALSHI-ACCESS-KEY': creds.apiKeyId,
-      'KALSHI-ACCESS-TIMESTAMP': timestamp,
-      'KALSHI-ACCESS-SIGNATURE': signature,
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) return { error: data.error || data.message || res.statusText };
-  return data;
-}
 async function cancelKalshiOrder(creds, orderId) {
   const path = `/trade-api/v2/portfolio/orders/${orderId}`;
   const baseUrl = process.env.KALSHI_API_BASE || 'https://api.elections.kalshi.com';
@@ -1167,15 +1659,16 @@ function gameKey(away, home) {
   return `${String(away).toUpperCase()}-${String(home).toUpperCase()}`;
 }
 
-function detectArbOpportunities(polyGames, kalshiGames, balances) {
+function detectArbOpportunities(polyGames, kalshiGames, balances, maxStakeOverride) {
+  const maxStake = maxStakeOverride != null ? Number(maxStakeOverride) : ARB_MAX_STAKE_USD;
   const opportunities = [];
   const byKey = new Map();
   for (const g of kalshiGames) byKey.set(gameKey(g.awayTeam, g.homeTeam), g);
   // Subtract active orders from available balance so we don't over-commit
   const activePolyReserved = balances?.polymarket?.activeOrdersUsdc || 0;
   const activeKalReserved = balances?.kalshi?.activeOrdersUsdc || 0;
-  const availPoly = balances?.polymarket?.balanceUsdc != null ? Math.max(1, balances.polymarket.balanceUsdc - ARB_RESERVE_POLY_USD - activePolyReserved) : ARB_MAX_STAKE_USD;
-  const availKal = balances?.kalshi?.balanceCents != null ? Math.max(1, (balances.kalshi.balanceCents / 100) - ARB_RESERVE_KAL_USD - activeKalReserved) : ARB_MAX_STAKE_USD;
+  const availPoly = balances?.polymarket?.balanceUsdc != null ? Math.max(1, balances.polymarket.balanceUsdc - ARB_RESERVE_POLY_USD - activePolyReserved) : maxStake;
+  const availKal = balances?.kalshi?.balanceCents != null ? Math.max(1, (balances.kalshi.balanceCents / 100) - ARB_RESERVE_KAL_USD - activeKalReserved) : maxStake;
 
   for (const poly of polyGames) {
     const key = gameKey(poly.awayTeam, poly.homeTeam);
@@ -1190,9 +1683,9 @@ function detectArbOpportunities(polyGames, kalshiGames, balances) {
     // Strategy 1: Home on Poly, Away on Kalshi. Arb if p_H_poly + p_A_kal < 1
     const sum1 = p_H_poly + p_A_kal;
     if (sum1 < 1) {
-      const idealStake = Math.min(ARB_MAX_STAKE_USD, ARB_MAX_STAKE_PER_ARB_USD);
+      const idealStake = maxStake;
       let x = Math.min(idealStake, availPoly, (availKal * p_H_poly) / p_A_kal);
-      x = Math.max(0, Math.min(x, ARB_MAX_STAKE_PER_ARB_USD));
+      x = Math.max(0, Math.min(x, maxStake));
       const y = (x * p_A_kal) / p_H_poly;
       if (y > availKal) continue;
       const K = x / p_H_poly;
@@ -1228,9 +1721,9 @@ function detectArbOpportunities(polyGames, kalshiGames, balances) {
     // Strategy 2: Away on Poly, Home on Kalshi. Arb if p_A_poly + p_H_kal < 1
     const sum2 = p_A_poly + p_H_kal;
     if (sum2 < 1) {
-      const idealStake = Math.min(ARB_MAX_STAKE_USD, ARB_MAX_STAKE_PER_ARB_USD);
+      const idealStake = maxStake;
       let x = Math.min(idealStake, availPoly, (availKal * p_A_poly) / p_H_kal);
-      x = Math.max(0, Math.min(x, ARB_MAX_STAKE_PER_ARB_USD));
+      x = Math.max(0, Math.min(x, maxStake));
       const y = (x * p_H_kal) / p_A_poly;
       if (y > availKal) continue;
       const K = x / p_A_poly;
@@ -1311,72 +1804,17 @@ app.post('/api/arb/execute', async (req, res) => {
   }
 
   try {
-    const base = `${req.protocol}://${req.get('host')}`;
-    const cookie = req.headers.cookie || '';
-
-    const polyOrderRes = await fetch(`${base}/api/polymarket/order`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', cookie },
-      body: JSON.stringify({
-        tokenId: opp.polyTokenId,
-        side: opp.polySide || 'BUY',
-        price: polyPrice,
-        size: polySize,
-        tickSize: opp.polyTickSize || '0.01',
-        negRisk: opp.polyNegRisk || false,
-      }),
-    });
-    const polyResult = await polyOrderRes.json().catch(() => ({}));
-    if (!polyOrderRes.ok) {
-      const polyErr = polyResult.error || 'Polymarket order failed';
-      const polyFix = polyResult.fix || '';
-      return res.status(polyOrderRes.status).json({
-        error: polyFix ? `${polyErr}\n\n${polyFix}` : polyErr,
-        polyResult: { error: polyErr, fix: polyFix, detail: polyResult.detail },
-      });
-    }
-
-    const kalshiOrderRes = await fetch(`${base}/api/kalshi/order`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', cookie },
-      body: JSON.stringify({
-        ticker: opp.kalshiTicker,
-        side: opp.kalshiSide || 'yes',
-        count: Math.max(1, Number(opp.kalshiCount) || 1),
-        yes_price: Math.min(99, Math.max(1, Number(opp.kalshiYesPriceCents) || 50)),
-        client_order_id: crypto.randomUUID(),
-      }),
-    });
-    const kalshiResult = await kalshiOrderRes.json().catch(() => ({}));
-    if (!kalshiOrderRes.ok) {
-      return res.status(kalshiOrderRes.status).json({
-        error: 'Kalshi order failed after Poly leg filled. Cancel the Poly order or hedge on Kalshi. ' + (kalshiResult.error || ''),
-        leg1Done: true,
-        polyResult,
-      });
-    }
-
-    // Log to arb history
-    appendArbHistory({
-      id: crypto.randomUUID(),
-      placedAt: Date.now(),
-      gameKey: opp.gameKey,
-      awayTeam: opp.awayTeam,
-      homeTeam: opp.homeTeam,
-      strategyLabel: opp.strategyLabel,
-      stakePolyUsd: opp.stakePolyUsd,
-      stakeKalshiUsd: opp.stakeKalshiUsd,
-      netProfitUsd: opp.netProfitUsd,
-      polyPrice: opp.polyPrice,
-      kalshiYesPriceCents: opp.kalshiYesPriceCents,
-      polyOrderId: polyResult?.orderID || polyResult?.id || null,
-      kalshiOrderId: kalshiResult?.order?.order_id || kalshiResult?.id || null,
-      status: 'placed',
-    });
-
-    res.json({ ok: true, poly: polyResult, kalshi: kalshiResult });
+    const result = await executeArb(opp, credsPoly, credsKal, req.session?.polyFunder || null);
+    res.json({ ok: true, ...result });
   } catch (err) {
     console.error('Arb execute error:', err);
+    if (err.leg1Done) {
+      return res.status(500).json({
+        error: 'Kalshi order failed after Poly leg filled. Cancel the Poly order or hedge on Kalshi. ' + err.message,
+        leg1Done: true,
+        polyResult: err.polyResult,
+      });
+    }
     res.status(500).json({ error: err.message || 'Arb execute failed' });
   }
 });
@@ -1708,6 +2146,7 @@ app.post('/api/auth/kalshi', (req, res) => {
     return res.status(400).json({ error: err.message || 'Invalid private key' });
   }
   req.session.kalshiCreds = { apiKeyId, privateKey };
+  connectKalshiWS({ apiKeyId, privateKey }); // start WS feed immediately on sign-in
   res.json({ ok: true });
 });
 
@@ -2197,6 +2636,69 @@ app.post('/api/arb/engine/stop', (req, res) => {
   res.json({ ok: true, stats: arbEngine.stats });
 });
 
+// ── Auto-Arb Engine API ───────────────────────────────────────────────────────
+app.get('/api/arb/auto/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  autoArbEngine.sseClients.add(res);
+  res.write(`data: ${JSON.stringify({ type: 'state', running: autoArbEngine.running, stats: autoArbEngine.stats, wsPolyConnected: polyWs?.readyState === 1, wsKalshiConnected: kalshiWs?.readyState === 1, ts: Date.now() })}\n\n`);
+  req.on('close', () => autoArbEngine.sseClients.delete(res));
+});
+
+app.post('/api/arb/auto/start', (req, res) => {
+  const { simulate = false, simBalancePoly = 1000, simBalanceKal = 1000, maxStakeUsd, exitThreshold } = req.body || {};
+  if (!simulate) {
+    if (!req.session?.polyCreds) return res.status(401).json({ error: 'Sign in to Polymarket first' });
+    if (!req.session?.kalshiCreds) return res.status(401).json({ error: 'Sign in to Kalshi first' });
+  }
+  if (autoArbEngine.running) return res.json({ ok: true, message: 'Auto-arb engine already running' });
+  autoArbEngine.simulate = Boolean(simulate);
+  autoArbEngine.simBalancePoly = Number(simBalancePoly) || 1000;
+  autoArbEngine.simBalanceKal  = Number(simBalanceKal)  || 1000;
+  autoArbEngine.maxStakeUsd = maxStakeUsd != null ? Math.max(1, Number(maxStakeUsd)) : ARB_MAX_STAKE_USD;
+  autoArbEngine.exitThreshold = exitThreshold != null ? Math.max(0.5, Math.min(2.0, Number(exitThreshold))) : 1.00;
+  autoArbEngine.credsPoly = req.session?.polyCreds || null;
+  autoArbEngine.credsKal  = req.session?.kalshiCreds || null;
+  autoArbEngine.polyFunder = req.session?.polyFunder || null;
+  autoArbEngine.cooldowns.clear();
+  autoArbEngine.openPositions.clear();
+  autoArbEngine.stats = { placed: 0, failed: 0, totalProfitUsd: 0 };
+  autoArbEngine.running = true;
+  autoArbEngine.startedAt = Date.now();
+  autoArbEngine._exitIntervalId = setInterval(() => checkEarlyExits(), 10000);
+  if (!simulate && req.session?.kalshiCreds) connectKalshiWS(req.session.kalshiCreds);
+  broadcastAutoArbEvent('started', { simulate: autoArbEngine.simulate, simBalancePoly: autoArbEngine.simBalancePoly, simBalanceKal: autoArbEngine.simBalanceKal, stats: autoArbEngine.stats });
+  console.log(`[AutoArb] Engine started (${autoArbEngine.simulate ? 'SIMULATION' : 'REAL'}, exit≥${autoArbEngine.exitThreshold})`);
+  res.json({ ok: true, simulate: autoArbEngine.simulate });
+});
+
+app.post('/api/arb/auto/stop', (req, res) => {
+  autoArbEngine.running = false;
+  if (autoArbEngine._exitIntervalId) { clearInterval(autoArbEngine._exitIntervalId); autoArbEngine._exitIntervalId = null; }
+  autoArbEngine.openPositions.clear();
+  broadcastAutoArbEvent('stopped', { stats: autoArbEngine.stats });
+  console.log('[AutoArb] Engine stopped');
+  res.json({ ok: true, stats: autoArbEngine.stats });
+});
+
+app.get('/api/arb/auto/status', (req, res) => {
+  res.json({
+    running: autoArbEngine.running,
+    startedAt: autoArbEngine.startedAt,
+    stats: autoArbEngine.stats,
+    simulate: autoArbEngine.simulate,
+    simBalancePoly: autoArbEngine.simBalancePoly,
+    simBalanceKal: autoArbEngine.simBalanceKal,
+    exitThreshold: autoArbEngine.exitThreshold,
+    openPositionCount: autoArbEngine.openPositions.size,
+    wsPolyConnected: polyWs?.readyState === 1,
+    wsKalshiConnected: kalshiWs?.readyState === 1,
+  });
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── Real-time P&L tracker ─────────────────────────────────────────────────────
 // GET /api/pnl
 // Returns per-arb P&L: current value of each leg vs original stake, unrealized P&L, best-exit hint.
@@ -2646,4 +3148,5 @@ app.patch('/api/arb/engine/config', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`NBA Odds Visualizer running at http://localhost:${PORT}`);
+  connectPolymarketWS(); // start WS immediately; tokens subscribed lazily as games are fetched
 });
