@@ -112,15 +112,31 @@
             <h3 class="arb-title">⚡ Auto-Arb Engine</h3>
             <p class="arb-hint">Executes risk-free arbs automatically via WebSocket price feeds.</p>
           </div>
-          <div class="arb-engine-mode-btns">
-            <label class="arb-mode-tab">
-              <input type="radio" name="autoArbMode" value="sim" id="autoArbModeSim" checked>
-              <span>Simulation</span>
-            </label>
-            <label class="arb-mode-tab">
-              <input type="radio" name="autoArbMode" value="real" id="autoArbModeReal">
-              <span>Real money</span>
-            </label>
+          <div class="arb-engine-header-right">
+            <div class="arb-engine-mode-btns">
+              <label class="arb-mode-tab">
+                <input type="radio" name="autoArbMode" value="sim" id="autoArbModeSim" checked>
+                <span>Simulation</span>
+              </label>
+              <label class="arb-mode-tab">
+                <input type="radio" name="autoArbMode" value="real" id="autoArbModeReal">
+                <span>Real money</span>
+              </label>
+            </div>
+            <div class="arb-sport-tabs">
+              <label class="arb-sport-tab">
+                <input type="radio" name="autoArbSport" value="nba" id="autoArbSportNBA" checked>
+                <span>NBA</span>
+              </label>
+              <label class="arb-sport-tab">
+                <input type="radio" name="autoArbSport" value="cs2" id="autoArbSportCS2">
+                <span>CS2</span>
+              </label>
+              <label class="arb-sport-tab">
+                <input type="radio" name="autoArbSport" value="both" id="autoArbSportBoth">
+                <span>Both</span>
+              </label>
+            </div>
           </div>
         </div>
 
@@ -185,9 +201,15 @@
         </div>
 
         <!-- Open positions grid -->
-        <div id="autoArbPositionsWrap" hidden>
+        <div id="autoArbOpenPositionsWrap" hidden>
           <p class="arb-section-label">Open positions</p>
-          <div id="autoArbPositionsGrid" class="arb-positions-grid"></div>
+          <div id="autoArbOpenPositionsGrid" class="arb-positions-grid"></div>
+        </div>
+
+        <!-- Closed positions grid -->
+        <div id="autoArbClosedPositionsWrap" hidden>
+          <p class="arb-section-label arb-section-label--closed">Closed positions</p>
+          <div id="autoArbClosedPositionsGrid" class="arb-positions-grid"></div>
         </div>
 
         <!-- Collapsible activity log -->

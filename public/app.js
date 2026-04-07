@@ -533,6 +533,8 @@ function renderArbPosCard(pos) {
       </div>`;
   }
 
+  const polyHref  = escapeHtml(pos.polyUrl  || '#');
+  const kalshiHref = escapeHtml(pos.kalshiUrl || '#');
   return `
     <div class="arb-pos-card${pos.closed ? ' arb-pos-card--closed' : ''}">
       <div class="arb-pos-header">
@@ -541,13 +543,13 @@ function renderArbPosCard(pos) {
       </div>
       <div class="arb-pos-legs">
         <div class="arb-pos-leg">
-          <div class="arb-pos-leg-platform poly">Polymarket</div>
+          <a class="arb-pos-leg-platform poly" href="${polyHref}" target="_blank" rel="noopener">Polymarket ↗</a>
           <div class="arb-pos-leg-team">${escapeHtml(polyTeam)} YES</div>
           <div class="arb-pos-leg-price">${polyPrice} · $${Number(pos.stakePolyUsd).toFixed(2)}</div>
           <div class="arb-pos-leg-id">${escapeHtml(pos.polyOrderId || '')}</div>
         </div>
         <div class="arb-pos-leg">
-          <div class="arb-pos-leg-platform kalshi">Kalshi</div>
+          <a class="arb-pos-leg-platform kalshi" href="${kalshiHref}" target="_blank" rel="noopener">Kalshi ↗</a>
           <div class="arb-pos-leg-team">${escapeHtml(kalTeam)} YES</div>
           <div class="arb-pos-leg-price">${kalPrice} · $${Number(pos.stakeKalshiUsd).toFixed(2)}</div>
           <div class="arb-pos-leg-id">${escapeHtml(pos.kalshiOrderId || '')}</div>
@@ -597,14 +599,22 @@ function updateAutoArbUI() {
     }
   }
 
-  // Positions grid
-  const posWrap = document.getElementById('autoArbPositionsWrap');
-  const posGrid = document.getElementById('autoArbPositionsGrid');
-  if (posWrap && posGrid) {
-    posWrap.hidden = autoArbPositions.length === 0;
-    if (!posWrap.hidden) {
-      posGrid.innerHTML = autoArbPositions.map(renderArbPosCard).join('');
-    }
+  // Open positions grid
+  const openWrap = document.getElementById('autoArbOpenPositionsWrap');
+  const openGrid = document.getElementById('autoArbOpenPositionsGrid');
+  const openPositions = autoArbPositions.filter(p => !p.closed);
+  if (openWrap && openGrid) {
+    openWrap.hidden = openPositions.length === 0;
+    if (!openWrap.hidden) openGrid.innerHTML = openPositions.map(renderArbPosCard).join('');
+  }
+
+  // Closed positions grid
+  const closedWrap = document.getElementById('autoArbClosedPositionsWrap');
+  const closedGrid = document.getElementById('autoArbClosedPositionsGrid');
+  const closedPositions = autoArbPositions.filter(p => p.closed);
+  if (closedWrap && closedGrid) {
+    closedWrap.hidden = closedPositions.length === 0;
+    if (!closedWrap.hidden) closedGrid.innerHTML = closedPositions.map(renderArbPosCard).join('');
   }
 
   // Activity log
@@ -618,6 +628,7 @@ function updateAutoArbUI() {
       if (ev.type === 'failed')      return `<div class="engine-feed-item error">[${t}] ${s}✗ ${ev.gameKey || ''} — ${ev.error}${ev.leg1Done ? ' (⚠ Poly filled, Kalshi failed)' : ''}</div>`;
       if (ev.type === 'exited')      return `<div class="engine-feed-item success">[${t}] ${s}✓ EXIT ${ev.strategyLabel} — actual +$${ev.actualProfitUsd}</div>`;
       if (ev.type === 'exit_failed') return `<div class="engine-feed-item error">[${t}] ${s}✗ Exit failed ${ev.gameKey || ''} — ${ev.error}</div>`;
+      if (ev.type === 'order_stale') return `<div class="engine-feed-item error">[${t}] ⚠ Stale order cancelled — ${ev.gameKey} (poly filled: ${ev.polyFilled}, kalshi filled: ${ev.kalshiFilled})</div>`;
       if (ev.type === 'started')     return `<div class="engine-feed-item">[${t}] Engine started (${ev.simulate ? 'SIMULATION' : 'REAL MONEY'})</div>`;
       if (ev.type === 'stopped')     return `<div class="engine-feed-item">[${t}] Engine stopped</div>`;
       return '';
@@ -665,6 +676,14 @@ function openAutoArbSSE() {
         autoArbRealizedPnl = Math.round((autoArbRealizedPnl + (ev.actualProfitUsd || 0)) * 100) / 100;
       }
 
+      if (ev.type === 'order_stale') {
+        const idx = autoArbPositions.findIndex(p => p.positionId === ev.positionId);
+        if (idx !== -1) {
+          autoArbUnrealizedPnl = Math.round((autoArbUnrealizedPnl - (autoArbPositions[idx].netProfitUsd || 0)) * 100) / 100;
+          autoArbPositions.splice(idx, 1);
+        }
+      }
+
       if (ev.type === 'stopped') {
         autoArbRunning = false;
         autoArbRealizedPnl   = 0;
@@ -692,12 +711,14 @@ async function startAutoArb() {
   const simBalanceKal  = parseFloat(document.getElementById('autoArbSimKal')?.value)  || 1000;
   const maxStakeUsd    = parseFloat(document.getElementById('autoArbMaxStake')?.value) || 50;
   const exitThreshold  = parseFloat(document.getElementById('autoArbExitThreshold')?.value) || 1.00;
+  const sportRadio = document.querySelector('input[name="autoArbSport"]:checked');
+  const sport = sportRadio?.value || 'nba';
   try {
     const res = await fetch(`${API_BASE}/api/arb/auto/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ simulate: isSim, simBalancePoly, simBalanceKal, maxStakeUsd, exitThreshold }),
+      body: JSON.stringify({ simulate: isSim, simBalancePoly, simBalanceKal, maxStakeUsd, exitThreshold, sport }),
     });
     const data = await res.json();
     if (!res.ok) { alert(data.error || 'Failed to start auto-arb'); return; }
