@@ -1,5 +1,37 @@
 [
   {
+    "id": "c6f8d981-727c-46c0-b812-591275f01f5f",
+    "placedAt": 1775512312916,
+    "gameKey": "MIA-TOR",
+    "awayTeam": "MIA",
+    "homeTeam": "TOR",
+    "strategyLabel": "Away (MIA) on Poly, Home (TOR) on Kalshi",
+    "stakePolyUsd": 50,
+    "stakeKalshiUsd": 58.54,
+    "netProfitUsd": 11.3,
+    "polyPrice": 0.41,
+    "kalshiYesPriceCents": 48,
+    "polyOrderId": "0x00f104db0eb86f02de2f7dda8c929d95b2fbefdc89563a2febc35b125eb1f8f8",
+    "kalshiOrderId": "acd20902-8258-434b-a1bd-177278d34ba4",
+    "status": "placed"
+  },
+  {
+    "id": "0e807dfd-a317-4fbd-a19d-388bad43cf4c",
+    "placedAt": 1775512309234,
+    "gameKey": "MIA-TOR",
+    "awayTeam": "MIA",
+    "homeTeam": "TOR",
+    "strategyLabel": "Away (MIA) on Poly, Home (TOR) on Kalshi",
+    "stakePolyUsd": 17.08,
+    "stakeKalshiUsd": 20,
+    "netProfitUsd": 3.87,
+    "polyPrice": 0.41,
+    "kalshiYesPriceCents": 48,
+    "polyOrderId": "0x0a97c6c55ae19c5e7f36b085016839337aba640da4b04845bace9198f9154f8a",
+    "kalshiOrderId": "ac95af6b-5c8a-4b78-8cf3-64eeca966a8b",
+    "status": "placed"
+  },
+  {
     "id": "239d840a-ff5e-4442-98b6-93914f8e046c",
     "placedAt": 1775463674562,
     "gameKey": "CHA-BOS",
