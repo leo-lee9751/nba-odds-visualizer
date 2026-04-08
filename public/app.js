@@ -656,6 +656,12 @@ function openAutoArbSSE() {
       if (ev.simBalanceKal  !== undefined) autoArbSimBalanceKal  = ev.simBalanceKal;
       if (ev.wsPolyConnected !== undefined) updateAutoArbWSBadge(ev.wsPolyConnected, ev.wsKalshiConnected);
 
+      // Hydrate open positions from server on initial state event
+      if (ev.type === 'state' && Array.isArray(ev.openPositions) && ev.openPositions.length > 0 && autoArbPositions.length === 0) {
+        autoArbPositions = ev.openPositions.map(p => ({ ...p, placedAt: p.ts || Date.now(), closed: false }));
+        autoArbUnrealizedPnl = Math.round(autoArbPositions.reduce((s, p) => s + (p.netProfitUsd || 0), 0) * 100) / 100;
+      }
+
       if (ev.type === 'placed') {
         autoArbPositions.unshift({ ...ev, placedAt: ev.ts || Date.now(), closed: false });
         autoArbUnrealizedPnl = Math.round((autoArbUnrealizedPnl + (ev.netProfitUsd || 0)) * 100) / 100;
@@ -676,6 +682,24 @@ function openAutoArbSSE() {
         autoArbRealizedPnl = Math.round((autoArbRealizedPnl + (ev.actualProfitUsd || 0)) * 100) / 100;
       }
 
+      if (ev.type === 'live_pnl' && Array.isArray(ev.positions)) {
+        for (const update of ev.positions) {
+          const pos = autoArbPositions.find(p => p.positionId === update.positionId);
+          if (pos) {
+            pos.livePnl = update.livePnl;
+            pos.currentPolyPrice = update.currentPolyPrice;
+            pos.currentKalshiCents = update.currentKalshiCents;
+            pos.sumPrices = update.sumPrices;
+          }
+        }
+        // Keep unrealized as the expected guaranteed profit (not live P&L)
+        autoArbUnrealizedPnl = Math.round(
+          autoArbPositions.filter(p => !p.closed).reduce((s, p) => s + (p.netProfitUsd || 0), 0) * 100
+        ) / 100;
+        updateAutoArbUI();
+        return; // don't add to feed
+      }
+
       if (ev.type === 'order_stale') {
         const idx = autoArbPositions.findIndex(p => p.positionId === ev.positionId);
         if (idx !== -1) {
@@ -688,7 +712,7 @@ function openAutoArbSSE() {
         autoArbRunning = false;
         autoArbRealizedPnl   = 0;
         autoArbUnrealizedPnl = 0;
-        if (autoArbSSE) { autoArbSSE.close(); autoArbSSE = null; }
+        // Don't close SSE — keep it open so positions hydrate on page reload
       }
 
       if (ev.type !== 'state') autoArbFeed.unshift(ev);
@@ -697,7 +721,7 @@ function openAutoArbSSE() {
     } catch (_) {}
   };
   autoArbSSE.onerror = () => {
-    if (!autoArbRunning) { if (autoArbSSE) { autoArbSSE.close(); autoArbSSE = null; } }
+    // Never close — let EventSource auto-reconnect to keep positions hydrated
   };
 }
 
@@ -1540,6 +1564,39 @@ async function sellPolyPosition(assetId, size, btn) {
   }
 }
 
+async function sellAllPolyPositions(btn) {
+  const openCount = arbHistory.filter(h => h.status === 'placed').length;
+  if (!openCount) return alert('No open positions to sell.');
+  if (!confirm(`Sell ALL ${openCount} open Polymarket positions at best bid? This cannot be undone.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Selling…';
+  try {
+    const res = await fetch('/api/polymarket/sell-all-positions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      btn.textContent = 'Failed';
+      alert('Sell-all failed: ' + (data.error || 'Unknown error'));
+    } else {
+      const sold = (data.results || []).filter(r => r.status === 'sold').length;
+      const errors = (data.results || []).filter(r => r.status === 'error');
+      btn.textContent = `Sold ${sold} groups`;
+      btn.style.background = 'var(--green, #22c55e)';
+      btn.style.color = '#000';
+      if (errors.length) alert(`${errors.length} group(s) failed:\n` + errors.map(e => `${e.gameKey}: ${e.error}`).join('\n'));
+      fetchArbHistory();
+      fetchMyOrders();
+    }
+  } catch (e) {
+    btn.textContent = 'Error';
+    alert('Sell-all error: ' + e.message);
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = 'Sell All Poly'; btn.style.background = ''; btn.style.color = ''; }, 5000);
+}
+
 function switchOrdersTab(tab) {
   document.querySelectorAll('.orders-tab').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === tab));
   document.querySelectorAll('.orders-panel').forEach((panel) => panel.classList.toggle('hidden', !panel.id.endsWith(tab)));
@@ -2093,6 +2150,9 @@ document.getElementById('betForm').addEventListener('submit', async (e) => {
   }
   startArbAutoRefresh();
   fetchArbHistory();
+
+  // Open SSE to hydrate open positions from arb-history (even when engine is stopped)
+  openAutoArbSSE();
 
   const simStartBtn = document.getElementById('simStartBtn');
   const simStopBtn = document.getElementById('simStopBtn');
