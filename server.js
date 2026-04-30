@@ -1681,12 +1681,30 @@ app.post('/api/auth/polymarket', async (req, res) => {
   };
   delete req.session.polyFunder;
   try {
-    const { Wallet } = await import('ethers');
+    const { Wallet, ethers } = await import('ethers');
     const wallet = new Wallet(String(privateKey).trim());
     if (funderAddress && /^0x[a-fA-F0-9]{40}$/.test(String(funderAddress).trim())) {
       req.session.polyFunder = String(funderAddress).trim().toLowerCase();
+    } else {
+      // Derive the Safe proxy address from the on-chain factory (read-only, deterministic — no signing)
+      try {
+        const provider = new ethers.providers.JsonRpcProvider('https://polygon-bor-rpc.publicnode.com', 137);
+        const factory = new ethers.Contract(
+          '0xaacFeEa03eb1561C4e67d661e40682Bd20e3541b',
+          ['function computeProxyAddress(address user) view returns (address)'],
+          provider
+        );
+        const proxy = await factory.computeProxyAddress(wallet.address);
+        const code = await provider.getCode(proxy);
+        // Only use proxy if it's actually deployed (i.e. account was created via Polymarket web UI)
+        if (code && code !== '0x') {
+          req.session.polyFunder = proxy.toLowerCase();
+          console.log('Auto-derived Polymarket proxy wallet:', proxy);
+        }
+      } catch (e) {
+        console.log('Proxy derivation skipped:', e.message);
+      }
     }
-    // Do NOT auto-fetch proxy — MetaMask users use EOA; auto-detect was causing "invalid signature" for them
   } catch (_) {}
   res.json({ ok: true });
 });
