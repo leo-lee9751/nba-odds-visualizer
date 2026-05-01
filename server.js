@@ -1391,6 +1391,8 @@ async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price,
   }
 
   let lastErr = null;
+  const apiKeyMasked = apiCreds.key ? `${apiCreds.key.slice(0, 8)}...` : '<empty>';
+  console.log(`[poly-order] starting: token=${tokenIdStr.slice(0, 12)}... side=${side} size=${size} negRisk=${negRisk} apiKey=${apiKeyMasked} EOA=${wallet.address.toLowerCase()}`);
   for (const { sigType, funderAddr } of attempts) {
     const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funderAddr);
     try { await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL }); } catch (_) {}
@@ -1399,28 +1401,34 @@ async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price,
     const priceRounded = roundPriceToTick(effectivePrice, ts);
     const sideVal = String(side).toUpperCase() === 'SELL' ? Side.SELL : Side.BUY;
     const userOrder = { tokenID: tokenIdStr, price: priceRounded, size: Number(size), side: sideVal };
+    console.log(`[poly-order]   attempt sigType=${sigType} funder=${String(funderAddr).toLowerCase()}`);
     try {
       const response = await client.createAndPostOrder(userOrder, { negRisk, tickSize: ts }, OrderType.FOK);
       const responseErr = response?.error || response?.errorMsg;
       if (responseErr) {
         lastErr = new Error(String(responseErr));
-        // Sig-type errors: try the next sigType. order_version_mismatch is what Polymarket
-        // returns when a Gnosis Safe (Magic/Gmail) account is signed as a Polymarket Proxy.
+        console.log(`[poly-order]     RESP ERROR: ${responseErr}`);
         if (/invalid signature|order_version_mismatch|not authorized/i.test(String(responseErr))) continue;
         throw lastErr;
       }
-      // FOK: if size_matched is 0 the order was cancelled (price moved, no fill)
       const matched = Number(response?.size_matched ?? response?.sizeMatched ?? response?.filled_size ?? -1);
-      if (matched === 0) throw new Error('Polymarket FOK: order not filled (price moved)');
+      if (matched === 0) {
+        console.log(`[poly-order]     FOK no fill (price moved)`);
+        throw new Error('Polymarket FOK: order not filled (price moved)');
+      }
+      console.log(`[poly-order]     OK matched=${matched}`);
       return response;
     } catch (err) {
       lastErr = err;
       const errMsg = err?.response?.data?.error || err?.message || '';
+      const status = err?.response?.status || '?';
+      console.log(`[poly-order]     CATCH (status ${status}): ${errMsg}`);
       if (err?.response?.status === 401 || err?.response?.status === 403
           || /invalid signature|order_version_mismatch|not authorized/i.test(errMsg)) continue;
       throw err;
     }
   }
+  console.log(`[poly-order] all attempts failed; final error: ${lastErr?.message}`);
   throw lastErr || new Error('Polymarket order failed');
 }
 
@@ -2855,6 +2863,128 @@ app.post('/api/auth/polymarket', async (req, res) => {
   // Auto-activate early exit monitor if both creds are now available
   activateEarlyExitMonitor(req);
   res.json({ ok: true });
+});
+
+// Server-side Polymarket credential derivation for Magic/Gmail signups.
+// User provides ONLY their private key + (optional) profile/funder address; we derive API
+// credentials using the right sigType for their account type. This eliminates the failure
+// mode where stored creds are tied to a different on-chain identity than the trader.
+//
+// POST /api/auth/polymarket-derive
+// Body: { privateKey, funderAddress? }
+// Tries (sigType, funder) combinations in priority order, calls createOrDeriveApiKey for each,
+// and validates by reading the balance. Returns the working creds on success.
+app.post('/api/auth/polymarket-derive', async (req, res) => {
+  const { privateKey, funderAddress } = req.body || {};
+  if (!privateKey || !String(privateKey).trim().startsWith('0x')) {
+    return res.status(400).json({ error: 'Need privateKey starting with 0x' });
+  }
+  const pk = String(privateKey).trim();
+
+  try {
+    const { ClobClient, AssetType } = await import('@polymarket/clob-client');
+    const { Wallet, ethers } = await import('ethers');
+    const wallet = new Wallet(pk);
+
+    // 1) Resolve funder address. Order: explicit > Polymarket profile API > Safe factory > EOA.
+    let funder = null;
+    if (funderAddress && /^0x[a-fA-F0-9]{40}$/.test(String(funderAddress).trim())) {
+      funder = String(funderAddress).trim().toLowerCase();
+    } else {
+      // Try Polymarket's public profile lookup — it returns the user's actual proxy.
+      try {
+        const apiFunder = await getPolyFunderAddress(wallet.address);
+        if (apiFunder) funder = apiFunder;
+      } catch (_) {}
+      if (!funder) {
+        try {
+          const provider = new ethers.providers.JsonRpcProvider('https://polygon-bor-rpc.publicnode.com', 137);
+          const factory = new ethers.Contract(
+            '0xaacFeEa03eb1561C4e67d661e40682Bd20e3541b',
+            ['function computeProxyAddress(address user) view returns (address)'],
+            provider
+          );
+          const proxy = await factory.computeProxyAddress(wallet.address);
+          const code = await provider.getCode(proxy);
+          if (code && code !== '0x') funder = String(proxy).toLowerCase();
+        } catch (_) {}
+      }
+      if (!funder) funder = wallet.address.toLowerCase();
+    }
+    const isProxy = funder !== wallet.address.toLowerCase();
+
+    // 2) Try sigTypes in priority order (Safe first for proxy accounts) and pick the FIRST one
+    // where derived creds successfully read a balance. That tells us we're talking to the
+    // right on-chain identity.
+    const sigOrder = isProxy ? [2, 1, 0] : [0, 1, 2];
+    const attempts = [];
+    let chosenCreds = null;
+    let chosenSigType = null;
+    for (const sigType of sigOrder) {
+      try {
+        const tempClient = new ClobClient('https://clob.polymarket.com', 137, wallet, undefined, sigType, funder);
+        const apiCreds = await tempClient.createOrDeriveApiKey();
+        const key = apiCreds.apiKey ?? apiCreds.key;
+        if (!key || !apiCreds.secret || !apiCreds.passphrase) {
+          attempts.push({ sigType, error: 'missing creds in derive response' });
+          continue;
+        }
+        // Validate by calling getBalanceAllowance — this fails if the API key/sigType/funder
+        // don't agree with what the CLOB has on record.
+        const fullCreds = { key, secret: apiCreds.secret, passphrase: apiCreds.passphrase };
+        const validateClient = new ClobClient('https://clob.polymarket.com', 137, wallet, fullCreds, sigType, funder);
+        const bal = await validateClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        const balanceUsdc = Number(BigInt(bal?.balance ?? 0)) / 1e6;
+        const allowanceUsdc = Number(BigInt(bal?.allowance ?? 0)) / 1e6;
+        attempts.push({ sigType, ok: true, balanceUsdc, allowanceUsdc, apiKeyMasked: `${key.slice(0, 8)}...` });
+        // Pick the FIRST sigType that returns a real balance (>0). That's the one whose
+        // on-chain identity matches the funds.
+        if (chosenCreds == null && balanceUsdc > 0) {
+          chosenCreds = fullCreds;
+          chosenSigType = sigType;
+          break;
+        }
+        // No balance? Could be a fresh/empty account. Stash as fallback.
+        if (chosenCreds == null) {
+          chosenCreds = fullCreds;
+          chosenSigType = sigType;
+        }
+      } catch (err) {
+        attempts.push({ sigType, error: err?.message || String(err) });
+      }
+    }
+
+    if (!chosenCreds) {
+      return res.status(502).json({
+        error: 'Could not derive any working API credentials. See attempts.',
+        attempts,
+        eoa: wallet.address.toLowerCase(),
+        funder,
+      });
+    }
+
+    req.session.polyCreds = {
+      apiKey: chosenCreds.key,
+      secret: chosenCreds.secret,
+      passphrase: chosenCreds.passphrase,
+      privateKey: pk,
+    };
+    req.session.polyFunder = funder;
+    req.session.polySigType = chosenSigType; // Hint for future calls (currently informational)
+    activateEarlyExitMonitor(req);
+    console.log(`[poly-derive] OK — sigType=${chosenSigType} funder=${funder} EOA=${wallet.address.toLowerCase()}`);
+    return res.json({
+      ok: true,
+      eoa: wallet.address.toLowerCase(),
+      funder,
+      sigType: chosenSigType,
+      apiKeyMasked: `${chosenCreds.key.slice(0, 8)}...`,
+      attempts,
+    });
+  } catch (err) {
+    console.error('[poly-derive] error:', err);
+    return res.status(500).json({ error: err?.message || 'derive failed' });
+  }
 });
 
 app.post('/api/auth/kalshi', (req, res) => {
