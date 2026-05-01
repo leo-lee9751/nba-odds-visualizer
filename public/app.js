@@ -1851,9 +1851,6 @@ document.getElementById('polySignInForm').addEventListener('submit', async (e) =
   e.preventDefault();
   const fd = new FormData(e.target);
   const payload = {
-    apiKey: fd.get('apiKey'),
-    secret: fd.get('secret'),
-    passphrase: fd.get('passphrase'),
     privateKey: fd.get('privateKey'),
     funderAddress: (fd.get('funderAddress') || '').trim() || undefined,
   };

@@ -1374,12 +1374,18 @@ async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price,
     : wallet.address.toLowerCase();
   const isProxy = funder !== wallet.address.toLowerCase();
   const tokenIdStr = normalizePolyTokenId(tokenId) || String(tokenId).trim();
-  // For Magic/Gmail signups (Gnosis Safe proxy), sigType=2 is the right one — try it FIRST
-  // when funder is a proxy. For MetaMask-created Polymarket Proxies, sigType=1 works.
-  // EOA-only goes last as a fallback.
-  const attempts = isProxy
+  // If the session has a known-good sigType (auth endpoint validated it), try that FIRST.
+  // Otherwise: Safe-first (sigType=2) for proxy accounts, EOA-first for direct wallets.
+  const knownSigType = polyCreds?.sigType;
+  const baseAttempts = isProxy
     ? [{ sigType: 2, funderAddr: funder }, { sigType: 1, funderAddr: funder }, { sigType: 0, funderAddr: wallet.address }]
     : [{ sigType: 0, funderAddr: wallet.address }, { sigType: 1, funderAddr: wallet.address }, { sigType: 2, funderAddr: wallet.address }];
+  const attempts = (knownSigType != null)
+    ? [
+        { sigType: knownSigType, funderAddr: knownSigType === 0 ? wallet.address : funder },
+        ...baseAttempts.filter(a => a.sigType !== knownSigType),
+      ]
+    : baseAttempts;
   // Simulate market orders with FOK at aggressive prices — no orderbook fetch needed (faster).
   // BUY: use 0.99 (max price, fills against any seller). SELL: use 0.01 (min price, fills against any buyer).
   // FOK ensures full fill or nothing — no partial resting orders.
@@ -2823,46 +2829,95 @@ function activateEarlyExitMonitor(req) {
 }
 
 app.post('/api/auth/polymarket', async (req, res) => {
-  const { apiKey, secret, passphrase, privateKey, funderAddress } = req.body || {};
-  if (!apiKey || !secret || !passphrase || !privateKey) {
-    return res.status(400).json({ error: 'Missing apiKey, secret, passphrase, or privateKey' });
+  const { privateKey, funderAddress } = req.body || {};
+  if (!privateKey || !String(privateKey).trim().startsWith('0x')) {
+    return res.status(400).json({ error: 'Missing privateKey (must start with 0x)' });
   }
-  req.session.polyCreds = {
-    apiKey: String(apiKey).trim(),
-    secret: String(secret).trim(),
-    passphrase: String(passphrase).trim(),
-    privateKey: String(privateKey).trim(),
-  };
-  delete req.session.polyFunder;
+  const pk = String(privateKey).trim();
+
   try {
+    const { ClobClient, AssetType } = await import('@polymarket/clob-client');
     const { Wallet, ethers } = await import('ethers');
-    const wallet = new Wallet(String(privateKey).trim());
+    const wallet = new Wallet(pk);
+
+    // 1) Resolve funder. Priority: explicit > Polymarket profile API > Safe factory > EOA.
+    let funder = null;
     if (funderAddress && /^0x[a-fA-F0-9]{40}$/.test(String(funderAddress).trim())) {
-      req.session.polyFunder = String(funderAddress).trim().toLowerCase();
+      funder = String(funderAddress).trim().toLowerCase();
     } else {
-      // Derive the Safe proxy address from the on-chain factory (read-only, deterministic — no signing)
+      try { const apiFunder = await getPolyFunderAddress(wallet.address); if (apiFunder) funder = apiFunder; } catch (_) {}
+      if (!funder) {
+        try {
+          const provider = new ethers.providers.JsonRpcProvider('https://polygon-bor-rpc.publicnode.com', 137);
+          const factory = new ethers.Contract(
+            '0xaacFeEa03eb1561C4e67d661e40682Bd20e3541b',
+            ['function computeProxyAddress(address user) view returns (address)'],
+            provider
+          );
+          const proxy = await factory.computeProxyAddress(wallet.address);
+          const code = await provider.getCode(proxy);
+          if (code && code !== '0x') funder = String(proxy).toLowerCase();
+        } catch (_) {}
+      }
+      if (!funder) funder = wallet.address.toLowerCase();
+    }
+    const isProxy = funder !== wallet.address.toLowerCase();
+
+    // 2) Derive fresh API creds server-side using the correct sigType for the account.
+    // Safe-first for proxy (Magic/Gmail); EOA-first for direct wallet. Validate each by reading
+    // balance — pick the FIRST one where balance > 0 (real on-chain identity match), else the
+    // last successful derivation as a fallback.
+    const sigOrder = isProxy ? [2, 1, 0] : [0, 1, 2];
+    const attempts = [];
+    let chosenCreds = null;
+    let chosenSigType = null;
+    for (const sigType of sigOrder) {
       try {
-        const provider = new ethers.providers.JsonRpcProvider('https://polygon-bor-rpc.publicnode.com', 137);
-        const factory = new ethers.Contract(
-          '0xaacFeEa03eb1561C4e67d661e40682Bd20e3541b',
-          ['function computeProxyAddress(address user) view returns (address)'],
-          provider
-        );
-        const proxy = await factory.computeProxyAddress(wallet.address);
-        const code = await provider.getCode(proxy);
-        // Only use proxy if it's actually deployed (i.e. account was created via Polymarket web UI)
-        if (code && code !== '0x') {
-          req.session.polyFunder = proxy.toLowerCase();
-          console.log('Auto-derived Polymarket proxy wallet:', proxy);
+        const tempClient = new ClobClient('https://clob.polymarket.com', 137, wallet, undefined, sigType, funder);
+        const apiCreds = await tempClient.createOrDeriveApiKey();
+        const key = apiCreds.apiKey ?? apiCreds.key;
+        if (!key || !apiCreds.secret || !apiCreds.passphrase) {
+          attempts.push({ sigType, error: 'missing creds in derive response' });
+          continue;
         }
-      } catch (e) {
-        console.log('Proxy derivation skipped:', e.message);
+        const fullCreds = { key, secret: apiCreds.secret, passphrase: apiCreds.passphrase };
+        const validateClient = new ClobClient('https://clob.polymarket.com', 137, wallet, fullCreds, sigType, funder);
+        const bal = await validateClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        const balanceUsdc = Number(BigInt(bal?.balance ?? 0)) / 1e6;
+        const allowanceUsdc = Number(BigInt(bal?.allowance ?? 0)) / 1e6;
+        attempts.push({ sigType, ok: true, balanceUsdc, allowanceUsdc, apiKeyMasked: `${key.slice(0, 8)}...` });
+        if (chosenCreds == null && balanceUsdc > 0) {
+          chosenCreds = fullCreds; chosenSigType = sigType; break;
+        }
+        if (chosenCreds == null) { chosenCreds = fullCreds; chosenSigType = sigType; }
+      } catch (err) {
+        attempts.push({ sigType, error: err?.message || String(err) });
       }
     }
-  } catch (_) {}
-  // Auto-activate early exit monitor if both creds are now available
-  activateEarlyExitMonitor(req);
-  res.json({ ok: true });
+
+    if (!chosenCreds) {
+      return res.status(502).json({
+        error: 'Could not derive any working API credentials. Polymarket may be having API trouble — try again in a minute.',
+        attempts, eoa: wallet.address.toLowerCase(), funder,
+      });
+    }
+
+    req.session.polyCreds = {
+      apiKey: chosenCreds.key,
+      secret: chosenCreds.secret,
+      passphrase: chosenCreds.passphrase,
+      privateKey: pk,
+      sigType: chosenSigType, // remembered so order placement uses it first
+    };
+    req.session.polyFunder = funder;
+    req.session.polySigType = chosenSigType;
+    activateEarlyExitMonitor(req);
+    console.log(`[poly-auth] OK — sigType=${chosenSigType} funder=${funder} EOA=${wallet.address.toLowerCase()}`);
+    return res.json({ ok: true, eoa: wallet.address.toLowerCase(), funder, sigType: chosenSigType });
+  } catch (err) {
+    console.error('[poly-auth] error:', err);
+    return res.status(500).json({ error: err?.message || 'sign-in failed' });
+  }
 });
 
 // Server-side Polymarket credential derivation for Magic/Gmail signups.
@@ -2968,6 +3023,7 @@ app.post('/api/auth/polymarket-derive', async (req, res) => {
       secret: chosenCreds.secret,
       passphrase: chosenCreds.passphrase,
       privateKey: pk,
+      sigType: chosenSigType, // remembered so order placement uses it first
     };
     req.session.polyFunder = funder;
     req.session.polySigType = chosenSigType; // Hint for future calls (currently informational)

@@ -37,14 +37,11 @@
   <div class="modal-overlay" id="polySignInModal" hidden>
     <div class="modal">
       <h3>Sign in to Polymarket</h3>
-      <p class="modal-hint">Get API key from Polymarket (derive from wallet). Never share your private key.</p>
+      <p class="modal-hint">Just paste your Polymarket private key — API credentials are derived server-side automatically.</p>
       <form id="polySignInForm" class="auth-form">
-        <label>API Key <input type="text" name="apiKey" placeholder="UUID" required /></label>
-        <label>Secret <input type="password" name="secret" placeholder="Base64 secret" required /></label>
-        <label>Passphrase <input type="password" name="passphrase" required /></label>
-        <label>Private key (for signing orders) <input type="password" name="privateKey" placeholder="0x..." required /></label>
-        <label>Profile address <input type="text" name="funderAddress" placeholder="0x... (only if you use email/Google sign-in)" /></label>
-        <p class="modal-hint" style="margin-top:0;font-size:0.85em;">If you signed up with email/Google, your USDC is in a proxy. Paste the address from polymarket.com → Settings → Wallet, or leave blank to auto-detect.</p>
+        <label>Private key <input type="password" name="privateKey" placeholder="0x... (export from polymarket.com → Settings)" required /></label>
+        <label>Profile address (optional) <input type="text" name="funderAddress" placeholder="0x... (your Polymarket wallet — leave blank to auto-detect)" /></label>
+        <p class="modal-hint" style="margin-top:0;font-size:0.85em;">If auto-detect picks the wrong address (rare), copy your wallet address from polymarket.com → click avatar → "Your Polymarket Wallet Address" and paste it here.</p>
         <label class="remember-me"><input type="checkbox" name="remember" /> Remember me on this device</label>
         <div class="modal-actions">
           <button type="button" class="auth-btn auth-btn-outline" id="closePolySignIn">Cancel</button>
