@@ -1292,18 +1292,27 @@ function detectValueOpportunities(polyGames, sharpOddsMap, minEdge = VALUE_MIN_E
     const key = gameKey(poly.awayTeam, poly.homeTeam);
     const sharp = sharpOddsMap.get(key);
     if (!sharp) continue;
-    for (const [side, tokenId, polyOddsField, sharpField, label] of [
-      ['away', poly.tokenIdAway, poly.awayOdds, sharp.away, `${poly.awayTeam}`],
-      ['home', poly.tokenIdHome, poly.homeOdds, sharp.home, `${poly.homeTeam}`],
+    // Engine only BUYs → fill at the ASK, not the mid/bid. Use bestAsk when WS-overlaid;
+    // fall back to (bid + 1 tick) when ask is missing. Using mid/bid would overstate the
+    // edge by half-spread and the resulting limit order wouldn't fill.
+    for (const [side, tokenId, askField, midField, sharpField, label] of [
+      ['away', poly.tokenIdAway, poly.awayAsk, poly.awayOdds, sharp.away, `${poly.awayTeam}`],
+      ['home', poly.tokenIdHome, poly.homeAsk, poly.homeOdds, sharp.home, `${poly.homeTeam}`],
     ]) {
       if (!tokenId) continue;
-      const polyProb = Math.max(0.01, Math.min(0.99, Number(polyOddsField) || 0.5));
+      // Execution price: ask if available, else mid + 1 tick (conservative — assume ask is one above mid).
+      const execPrice = askField != null ? Number(askField) : (Number(midField) || 0.5) + 0.01;
+      const polyProb = Math.max(0.01, Math.min(0.99, execPrice));
       const sharpProb = sharpField;
-      const edge = sharpProb - polyProb;
+      const edge = sharpProb - polyProb; // edge against price we'd actually pay
       if (edge < minEdge) continue;
       opportunities.push({
         gameKey: key, awayTeam: poly.awayTeam, homeTeam: poly.homeTeam,
-        side, label, polyProb, sharpProb,
+        side, label,
+        polyProb,                                // execution price (ask) — used for orders
+        polyMid: Number(midField) || null,       // reference mid, for diagnostics
+        polyAsk: askField != null ? Number(askField) : null,
+        sharpProb,
         edge: Math.round(edge * 1000) / 1000,
         edgePct: Math.round(edge * 10000) / 100,
         polyTokenId: tokenId,
@@ -1811,12 +1820,24 @@ async function runValueEngineIteration() {
       if (now - lastOrder < cfg.cooldownMs) continue;
       const orderUsd = Math.min(cfg.orderSizeUsd, cfg.maxPositionUsd - positionSoFar, polyBal - cfg.circuitBreakerPolyUsd);
       if (orderUsd < 1) continue;
-      const price = opp.polyProb;
+      // Last-mile WS freshness: re-read the live ASK for this token before firing. The opp's snapshot
+      // ask may be hundreds of ms old; the WS-pushed game state is current. If the live ask drifted
+      // past (sharp - minEdge), bail — the opportunity has already been arbed away.
+      const liveGame = polyGamesState.get(opp.gameKey);
+      const liveAsk = liveGame
+        ? Number(opp.side === 'away' ? liveGame.awayAsk : liveGame.homeAsk)
+        : null;
+      const snapshotAsk = opp.polyProb;
+      const price = (liveAsk != null && Number.isFinite(liveAsk)) ? liveAsk : snapshotAsk;
+      if (liveAsk != null && Number.isFinite(liveAsk) && opp.sharpProb != null && (opp.sharpProb - liveAsk) < cfg.minEdge) {
+        broadcastEngineEvent('opp_evaporated', { gameKey: opp.gameKey, label: opp.label, liveAsk, snapshotAsk, sharpProb: opp.sharpProb });
+        continue;
+      }
       const shareCount = Math.max(1, Math.floor(orderUsd / Math.max(0.01, price)));
       arbEngine.stats.betsAttempted++;
       arbEngine.cooldowns.set(posKey, now);
       const betId = crypto.randomUUID();
-      broadcastEngineEvent('bet_attempting', { betId, gameKey: opp.gameKey, label: opp.label, orderUsd, price, edge: opp.edgePct });
+      broadcastEngineEvent('bet_attempting', { betId, gameKey: opp.gameKey, label: opp.label, orderUsd, price, edge: opp.edgePct, priceSource: liveAsk != null ? 'ws-ask' : 'snapshot-ask' });
       const result = await placePolyOrderDirect(credsPoly, polyFunder, {
         tokenId: opp.polyTokenId, side: 'BUY', price, size: shareCount,
         tickSize: opp.polyTickSize || '0.01', negRisk: opp.polyNegRisk || false,
@@ -2177,7 +2198,37 @@ app.post('/api/arb/execute', async (req, res) => {
   }
 
   const stakePoly = Number(opp.stakePolyUsd) || 0;
-  const polyPrice = Number(opp.polyPrice) || 0.5;
+  const clientPolyPrice = Number(opp.polyPrice) || 0.5;
+  // Last-mile WS freshness for the manual panel: client snapshot can be hundreds of ms old.
+  // Side-aware: BUY fills at ASK (we pay), SELL fills at BID (we receive). Compare drift against
+  // the SAME-side live price; using mid would mask half-spread of real drift.
+  const ARB_PRICE_DRIFT_TOLERANCE = 0.005; // 0.5¢ adverse move
+  const side = String(opp.polySide || 'BUY').toUpperCase();
+  const liveGame = polyGamesState.get(opp.gameKey);
+  let polyPrice = clientPolyPrice;
+  if (liveGame) {
+    // For BUY → look at the side we'd pay (ask). For SELL → the side we'd receive (bid is in awayOdds/homeOdds
+    // per counterstrike's WS handler at server.js:580).
+    const isAway = String(liveGame.tokenIdAway) === String(opp.polyTokenId);
+    const liveBid = Number(isAway ? liveGame.awayOdds : liveGame.homeOdds); // counterstrike stores bid as "Odds"
+    const liveAsk = Number(isAway ? liveGame.awayAsk : liveGame.homeAsk);
+    const liveExecPrice = side === 'SELL' ? liveBid : liveAsk;
+    if (Number.isFinite(liveExecPrice) && liveExecPrice > 0) {
+      const drift = liveExecPrice - clientPolyPrice;
+      const adverseDrift = side === 'SELL' ? -drift : drift; // BUY: ask up = bad; SELL: bid down = bad
+      if (adverseDrift > ARB_PRICE_DRIFT_TOLERANCE) {
+        return res.status(409).json({
+          error: `Price moved against you while you were clicking. Live ${side === 'SELL' ? 'bid' : 'ask'} ${liveExecPrice.toFixed(3)} vs your snapshot ${clientPolyPrice.toFixed(3)} (drift ${(adverseDrift * 100).toFixed(1)}¢). Refresh the panel and re-evaluate.`,
+          livePrice: liveExecPrice,
+          liveBid: Number.isFinite(liveBid) ? liveBid : null,
+          liveAsk: Number.isFinite(liveAsk) ? liveAsk : null,
+          snapshotPrice: clientPolyPrice,
+        });
+      }
+      // Use the live execution-side price so we trade at what the book actually shows.
+      polyPrice = liveExecPrice;
+    }
+  }
   const polySize = Math.max(1, Math.floor(stakePoly / Math.max(0.01, polyPrice)));
   const polyNotional = polySize * polyPrice;
   if (polyNotional < 1) {
