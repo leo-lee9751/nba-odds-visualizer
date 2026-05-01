@@ -95,6 +95,38 @@ function updateArbHistoryEntry(id, fields) {
 
 app.get('/api/arb-history', (req, res) => res.json(readArbHistory()));
 app.delete('/api/arb-history', (req, res) => { writeArbHistory([]); res.json({ ok: true }); });
+
+// ── Arb fills log: every executeArb call writes one JSON line here. ──────────
+// Captures EXPECTED prices (what the engine thought) vs ACTUAL fills (what FOK gave us)
+// plus per-leg status and rollback action if a leg failed. Append-only, line-delimited
+// JSON so it's easy to tail/grep. Read via /api/arb/fills-log?n=20.
+const ARB_FILLS_LOG_FILE = path.join(__dirname, 'arb-fills.log');
+function appendFillsLog(entry) {
+  try {
+    const line = JSON.stringify({ ts: Date.now(), ...entry }) + '\n';
+    fs.appendFileSync(ARB_FILLS_LOG_FILE, line);
+  } catch (err) {
+    console.error('[fills-log] write failed:', err.message);
+  }
+}
+function readFillsLog(limit = 50) {
+  try {
+    const raw = fs.readFileSync(ARB_FILLS_LOG_FILE, 'utf8');
+    const lines = raw.split('\n').filter(Boolean);
+    const last = lines.slice(-limit);
+    return last.map((l) => { try { return JSON.parse(l); } catch { return { parseError: l }; } }).reverse();
+  } catch { return []; }
+}
+// View recent fills via browser: http://localhost:3000/api/arb/fills-log?n=20
+app.get('/api/arb/fills-log', (req, res) => {
+  const n = Math.min(500, Math.max(1, Number(req.query.n) || 50));
+  res.json({ entries: readFillsLog(n), file: ARB_FILLS_LOG_FILE });
+});
+// Wipe fills log (use sparingly)
+app.delete('/api/arb/fills-log', (req, res) => {
+  try { fs.writeFileSync(ARB_FILLS_LOG_FILE, ''); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
 // ───────────────────────────────────────────────────────────────────────────
 
 // Today's scoreboard (live/final scores) + upcoming (next 7 days) from schedule
@@ -1426,60 +1458,192 @@ async function placeKalshiOrderDirect(kalshiCreds, ticker, side, count, yesPrice
   return data;
 }
 
-// Execute both legs of an arb. Used by manual /api/arb/execute AND auto-arb engine.
+// Extract the actual fill price from a Polymarket FOK response.
+// Uses (taker_amount / size_matched) when both are present, else falls back to maker_amount math.
+// Returns null if we can't compute it from the response shape.
+function extractPolyFillPrice(polyResp) {
+  if (!polyResp) return null;
+  const matched = Number(polyResp.size_matched ?? polyResp.sizeMatched ?? polyResp.filled_size ?? 0);
+  if (!matched) return null;
+  const taker = Number(polyResp.taker_amount ?? polyResp.takerAmount ?? 0);
+  if (taker > 0) return taker / matched;
+  // Fallback: makingAmount / matchedAmount (some response shapes)
+  const making = Number(polyResp.making_amount ?? polyResp.makingAmount ?? 0);
+  if (making > 0) return making / matched;
+  return null;
+}
+// Extract the actual fill price (in cents) from a Kalshi order response.
+function extractKalshiFillCents(kalshiResp) {
+  const order = kalshiResp?.order ?? kalshiResp ?? {};
+  // Kalshi response includes filled_count and the avg fill price varies by API version.
+  const yes = Number(order.yes_price ?? order.fill_price ?? order.avg_fill_price);
+  if (Number.isFinite(yes) && yes > 0 && yes < 100) return yes;
+  return null;
+}
+
+// Execute both legs of an arb in parallel with automatic rollback on partial failure.
+// Used by manual /api/arb/execute AND auto-arb engine. Writes a fill record (expected vs
+// actual) to arb-fills.log on every call — success, failure, or rollback.
 async function executeArb(opp, credsPoly, credsKal, polyFunder) {
   const stakePoly = Number(opp.stakePolyUsd) || 0;
   const polyPrice = Number(opp.polyPrice) || 0.5;
   const polySize = Math.max(1, Math.floor(stakePoly / Math.max(0.01, polyPrice)));
   if (polySize * polyPrice < 1) throw new Error(`Stake too small: $${(polySize * polyPrice).toFixed(2)} (min $1 notional)`);
+  const kalshiCount = Math.max(1, Number(opp.kalshiCount) || 1);
+  const kalshiSide = opp.kalshiSide || 'yes';
+  const kalshiPriceCents = Math.min(99, Math.max(1, Number(opp.kalshiYesPriceCents) || 50));
 
-  const polyResult = await placePolymarketOrderDirect(
-    credsPoly, polyFunder,
-    opp.polyTokenId, polyPrice, polySize,
-    opp.polyTickSize || '0.01', opp.polyNegRisk || false
-  );
+  const t0 = Date.now();
+  // Fire both legs IN PARALLEL — minimizes the window where prices can move between legs.
+  // Both functions use aggressive prices (Poly FOK at 0.99, Kalshi limit at 99c) so they
+  // either fill immediately and fully, or fail fast.
+  const [polySettle, kalSettle] = await Promise.allSettled([
+    placePolymarketOrderDirect(
+      credsPoly, polyFunder,
+      opp.polyTokenId, polyPrice, polySize,
+      opp.polyTickSize || '0.01', opp.polyNegRisk || false
+    ),
+    placeKalshiOrderDirect(credsKal, opp.kalshiTicker, kalshiSide, kalshiCount, kalshiPriceCents),
+  ]);
+  const elapsedMs = Date.now() - t0;
 
-  let kalshiResult;
-  try {
-    kalshiResult = await placeKalshiOrderDirect(
-      credsKal, opp.kalshiTicker,
-      opp.kalshiSide || 'yes',
-      Math.max(1, Number(opp.kalshiCount) || 1),
-      Math.min(99, Math.max(1, Number(opp.kalshiYesPriceCents) || 50))
-    );
-  } catch (kalErr) {
-    throw Object.assign(kalErr, { leg1Done: true, polyResult });
+  const polyOk = polySettle.status === 'fulfilled';
+  const kalOk = kalSettle.status === 'fulfilled';
+  const polyResult = polyOk ? polySettle.value : null;
+  const kalshiResult = kalOk ? kalSettle.value : null;
+  const polyError = polyOk ? null : (polySettle.reason?.message || String(polySettle.reason));
+  const kalError = kalOk ? null : (kalSettle.reason?.message || String(kalSettle.reason));
+
+  // Extract actual fill prices (the whole point of this logging).
+  const polyFillPrice = extractPolyFillPrice(polyResult);
+  const kalFillCents = extractKalshiFillCents(kalshiResult);
+  const polyDriftCents = (polyFillPrice != null) ? Math.round((polyFillPrice - polyPrice) * 1000) / 10 : null;
+  const kalDriftCents = (kalFillCents != null) ? Math.round((kalFillCents - kalshiPriceCents) * 10) / 10 : null;
+
+  // Common log payload
+  const logBase = {
+    gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+    strategy: opp.strategy, strategyLabel: opp.strategyLabel,
+    expected: {
+      polyPrice, polyShares: polySize, polyNotionalUsd: polySize * polyPrice,
+      kalshiYesPriceCents: kalshiPriceCents, kalshiCount,
+      netProfitUsd: opp.netProfitUsd,
+    },
+    actual: {
+      polyFillPrice, polyDriftCents, polyOrderId: polyResult?.orderID || polyResult?.id || null,
+      kalFillCents, kalDriftCents, kalshiOrderId: kalshiResult?.order?.order_id || kalshiResult?.id || null,
+    },
+    elapsedMs,
+  };
+
+  // ── Both succeeded: normal happy path ────────────────────────────────────
+  if (polyOk && kalOk) {
+    const historyEntry = {
+      id: crypto.randomUUID(), placedAt: Date.now(),
+      gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+      strategyLabel: opp.strategyLabel, strategy: opp.strategy,
+      stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
+      netProfitUsd: opp.netProfitUsd, polyPrice: opp.polyPrice,
+      kalshiYesPriceCents: opp.kalshiYesPriceCents,
+      polyOrderId: polyResult?.orderID || polyResult?.id || null,
+      kalshiOrderId: kalshiResult?.order?.order_id || kalshiResult?.id || null,
+      polyTokenId: opp.polyTokenId, polyTickSize: opp.polyTickSize || '0.01', polyNegRisk: Boolean(opp.polyNegRisk),
+      polyShares: polySize,
+      polyFillPrice, kalFillCents,                   // ← actual fill prices
+      polyDriftCents, kalDriftCents,                 // ← drift vs expected
+      kalshiTicker: opp.kalshiTicker, kalshiSide, kalshiCount,
+      status: 'placed',
+    };
+    appendArbHistory(historyEntry);
+    autoArbEngine.openPositions.set(historyEntry.id, {
+      id: historyEntry.id,
+      gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
+      strategyLabel: opp.strategyLabel, strategy: opp.strategy,
+      entryPolyPrice: opp.polyPrice, entryKalshiCents: opp.kalshiYesPriceCents,
+      polyShares: polySize, kalshiCount,
+      polyTokenId: opp.polyTokenId, polyTickSize: opp.polyTickSize || '0.01', polyNegRisk: opp.polyNegRisk || false,
+      kalshiTicker: opp.kalshiTicker, kalshiSide,
+      stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
+      netProfitUsd: opp.netProfitUsd, simulate: false, placedAt: Date.now(),
+    });
+    appendFillsLog({ ...logBase, status: 'both_filled', positionId: historyEntry.id });
+    return { poly: polyResult, kalshi: kalshiResult, positionId: historyEntry.id };
   }
 
-  const historyEntry = {
-    id: crypto.randomUUID(), placedAt: Date.now(),
-    gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
-    strategyLabel: opp.strategyLabel, strategy: opp.strategy,
-    stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
-    netProfitUsd: opp.netProfitUsd, polyPrice: opp.polyPrice,
-    kalshiYesPriceCents: opp.kalshiYesPriceCents,
-    polyOrderId: polyResult?.orderID || polyResult?.id || null,
-    kalshiOrderId: kalshiResult?.order?.order_id || kalshiResult?.id || null,
-    polyTokenId: opp.polyTokenId, polyTickSize: opp.polyTickSize || '0.01', polyNegRisk: Boolean(opp.polyNegRisk),
-    polyShares: Math.max(1, Math.floor(opp.stakePolyUsd / opp.polyPrice)),
-    kalshiTicker: opp.kalshiTicker, kalshiSide: opp.kalshiSide || 'yes', kalshiCount: opp.kalshiCount,
-    status: 'placed',
-  };
-  appendArbHistory(historyEntry);
-  autoArbEngine.openPositions.set(historyEntry.id, {
-    id: historyEntry.id,
-    gameKey: opp.gameKey, awayTeam: opp.awayTeam, homeTeam: opp.homeTeam,
-    strategyLabel: opp.strategyLabel, strategy: opp.strategy,
-    entryPolyPrice: opp.polyPrice, entryKalshiCents: opp.kalshiYesPriceCents,
-    polyShares: Math.max(1, Math.floor(opp.stakePolyUsd / opp.polyPrice)),
-    kalshiCount: opp.kalshiCount,
-    polyTokenId: opp.polyTokenId, polyTickSize: opp.polyTickSize || '0.01', polyNegRisk: opp.polyNegRisk || false,
-    kalshiTicker: opp.kalshiTicker, kalshiSide: opp.kalshiSide || 'yes',
-    stakePolyUsd: opp.stakePolyUsd, stakeKalshiUsd: opp.stakeKalshiUsd,
-    netProfitUsd: opp.netProfitUsd, simulate: false, placedAt: Date.now(),
+  // ── Partial failure: roll back the leg that DID fill ─────────────────────
+  // Best-effort flatten. Both rollback functions use aggressive prices to ensure they fill.
+  let rollback = null;
+  if (polyOk && !kalOk) {
+    // Poly filled, Kalshi didn't → sell the Poly position back at market.
+    try {
+      const sellResult = await placePolymarketOrderDirect(
+        credsPoly, polyFunder, opp.polyTokenId, 0.5, polySize,
+        opp.polyTickSize || '0.01', opp.polyNegRisk || false, 'SELL'
+      );
+      const exitPrice = extractPolyFillPrice(sellResult);
+      rollback = {
+        leg: 'poly',
+        action: 'SELL',
+        ok: true,
+        sharesFlattened: polySize,
+        exitFillPrice: exitPrice,
+        netLossUsd: (polyFillPrice != null && exitPrice != null) ? Math.round((polyFillPrice - exitPrice) * polySize * 100) / 100 : null,
+      };
+    } catch (rbErr) {
+      rollback = { leg: 'poly', action: 'SELL', ok: false, error: rbErr.message, sharesFlattened: 0 };
+    }
+  } else if (kalOk && !polyOk) {
+    // Kalshi filled, Poly didn't → sell the Kalshi position back at market.
+    try {
+      const sellResult = await placeKalshiOrderDirect(
+        credsKal, opp.kalshiTicker, kalshiSide, kalshiCount, 1, 'sell'
+      );
+      const exitCents = extractKalshiFillCents(sellResult);
+      rollback = {
+        leg: 'kalshi',
+        action: 'SELL',
+        ok: true,
+        countFlattened: kalshiCount,
+        exitFillCents: exitCents,
+        netLossUsd: (kalFillCents != null && exitCents != null) ? Math.round((kalFillCents - exitCents) * kalshiCount) / 100 : null,
+      };
+    } catch (rbErr) {
+      rollback = { leg: 'kalshi', action: 'SELL', ok: false, error: rbErr.message, countFlattened: 0 };
+    }
+  }
+
+  // ── Log everything and throw a meaningful error ──────────────────────────
+  const status = polyOk && kalOk ? 'both_filled'
+    : (!polyOk && !kalOk) ? 'both_failed'
+    : (polyOk ? 'kalshi_failed' : 'poly_failed');
+  appendFillsLog({
+    ...logBase,
+    status,
+    polyError, kalError,
+    rollback,
   });
 
-  return { poly: polyResult, kalshi: kalshiResult, positionId: historyEntry.id };
+  if (!polyOk && !kalOk) {
+    throw new Error(`Both legs failed. Poly: ${polyError}. Kalshi: ${kalError}.`);
+  }
+  // One leg succeeded, the other failed
+  if (rollback?.ok) {
+    const lossNote = rollback.netLossUsd != null ? ` Rollback cost: $${rollback.netLossUsd.toFixed(2)}.` : '';
+    throw new Error(
+      `${polyOk ? 'Kalshi' : 'Polymarket'} leg failed; rolled back the ${polyOk ? 'Poly' : 'Kalshi'} fill.${lossNote} Original error: ${polyOk ? kalError : polyError}`
+    );
+  }
+  // Rollback failed — user has uncovered position, manual intervention needed
+  const err = new Error(
+    `${polyOk ? 'Kalshi' : 'Polymarket'} leg failed AND rollback of the ${polyOk ? 'Poly' : 'Kalshi'} leg failed. ` +
+    `MANUAL ACTION REQUIRED — close the ${polyOk ? 'Poly' : 'Kalshi'} position. ` +
+    `Original: ${polyOk ? kalError : polyError}. Rollback: ${rollback?.error || '(none attempted)'}`
+  );
+  err.leg1Done = true;
+  err.polyResult = polyResult;
+  err.kalshiResult = kalshiResult;
+  err.rollback = rollback;
+  throw err;
 }
 
 function executeArbSimulated(opp) {
