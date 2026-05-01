@@ -1396,42 +1396,78 @@ async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price,
     effectivePrice = 0.99; // buy at any price — FOK matches against best ask
   }
 
+  // Resolve authoritative negRisk for this token by querying the CLOB. The negRisk flag
+  // controls which exchange contract the order is signed for (NegRiskCtfExchange vs
+  // CTFExchange). Wrong flag → order_version_mismatch on every sigType. The arb-detection
+  // upstream sometimes reads stale/wrong metadata, so we re-derive at order time.
+  let resolvedNegRisk = Boolean(negRisk);
+  try {
+    const r = await fetch(`https://clob.polymarket.com/markets/?token_id=${encodeURIComponent(tokenIdStr)}`);
+    if (r.ok) {
+      const m = await r.json();
+      const market = Array.isArray(m) ? m[0] : (m?.data?.[0] ?? m);
+      const apiNegRisk = market?.neg_risk ?? market?.negRisk;
+      if (typeof apiNegRisk === 'boolean') {
+        if (apiNegRisk !== resolvedNegRisk) {
+          console.log(`[poly-order] negRisk override: ${negRisk} → ${apiNegRisk} (from CLOB market)`);
+        }
+        resolvedNegRisk = apiNegRisk;
+      }
+    }
+  } catch (_) { /* fall back to caller's flag */ }
+
   let lastErr = null;
   const apiKeyMasked = apiCreds.key ? `${apiCreds.key.slice(0, 8)}...` : '<empty>';
-  console.log(`[poly-order] starting: token=${tokenIdStr.slice(0, 12)}... side=${side} size=${size} negRisk=${negRisk} apiKey=${apiKeyMasked} EOA=${wallet.address.toLowerCase()}`);
-  for (const { sigType, funderAddr } of attempts) {
-    const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funderAddr);
-    try { await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL }); } catch (_) {}
-    let ts = tickSize;
-    try { const mt = await client.getTickSize(tokenIdStr); if (mt != null) ts = polyTickSizeSupported(String(mt)); } catch (_) {}
-    const priceRounded = roundPriceToTick(effectivePrice, ts);
-    const sideVal = String(side).toUpperCase() === 'SELL' ? Side.SELL : Side.BUY;
-    const userOrder = { tokenID: tokenIdStr, price: priceRounded, size: Number(size), side: sideVal };
-    console.log(`[poly-order]   attempt sigType=${sigType} funder=${String(funderAddr).toLowerCase()}`);
-    try {
-      const response = await client.createAndPostOrder(userOrder, { negRisk, tickSize: ts }, OrderType.FOK);
-      const responseErr = response?.error || response?.errorMsg;
-      if (responseErr) {
-        lastErr = new Error(String(responseErr));
-        console.log(`[poly-order]     RESP ERROR: ${responseErr}`);
-        if (/invalid signature|order_version_mismatch|not authorized/i.test(String(responseErr))) continue;
-        throw lastErr;
+  console.log(`[poly-order] starting: token=${tokenIdStr.slice(0, 12)}... side=${side} size=${size} negRisk=${resolvedNegRisk} apiKey=${apiKeyMasked} EOA=${wallet.address.toLowerCase()}`);
+
+  // Brute-force fallback: if every (sigType × resolvedNegRisk) attempt fails with
+  // order_version_mismatch, try the SAME sigTypes with the OPPOSITE negRisk before giving up.
+  // This catches cases where the CLOB market endpoint reports stale/wrong neg_risk.
+  const negRiskTries = [resolvedNegRisk, !resolvedNegRisk];
+  for (const tryNegRisk of negRiskTries) {
+    let allVersionMismatch = true;
+    for (const { sigType, funderAddr } of attempts) {
+      const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funderAddr);
+      try { await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL }); } catch (_) {}
+      let ts = tickSize;
+      try { const mt = await client.getTickSize(tokenIdStr); if (mt != null) ts = polyTickSizeSupported(String(mt)); } catch (_) {}
+      const priceRounded = roundPriceToTick(effectivePrice, ts);
+      const sideVal = String(side).toUpperCase() === 'SELL' ? Side.SELL : Side.BUY;
+      const userOrder = { tokenID: tokenIdStr, price: priceRounded, size: Number(size), side: sideVal };
+      console.log(`[poly-order]   attempt sigType=${sigType} negRisk=${tryNegRisk} funder=${String(funderAddr).toLowerCase()}`);
+      try {
+        const response = await client.createAndPostOrder(userOrder, { negRisk: tryNegRisk, tickSize: ts }, OrderType.FOK);
+        const responseErr = response?.error || response?.errorMsg;
+        if (responseErr) {
+          lastErr = new Error(String(responseErr));
+          console.log(`[poly-order]     RESP ERROR: ${responseErr}`);
+          if (!/order_version_mismatch/i.test(String(responseErr))) allVersionMismatch = false;
+          if (/invalid signature|order_version_mismatch|not authorized/i.test(String(responseErr))) continue;
+          throw lastErr;
+        }
+        const matched = Number(response?.size_matched ?? response?.sizeMatched ?? response?.filled_size ?? -1);
+        if (matched === 0) {
+          console.log(`[poly-order]     FOK no fill (price moved)`);
+          throw new Error('Polymarket FOK: order not filled (price moved)');
+        }
+        console.log(`[poly-order]     OK matched=${matched} (sigType=${sigType} negRisk=${tryNegRisk})`);
+        return response;
+      } catch (err) {
+        lastErr = err;
+        const errMsg = err?.response?.data?.error || err?.message || '';
+        const status = err?.response?.status || '?';
+        console.log(`[poly-order]     CATCH (status ${status}): ${errMsg}`);
+        if (!/order_version_mismatch/i.test(errMsg)) allVersionMismatch = false;
+        if (err?.response?.status === 401 || err?.response?.status === 403
+            || /invalid signature|order_version_mismatch|not authorized/i.test(errMsg)) continue;
+        throw err;
       }
-      const matched = Number(response?.size_matched ?? response?.sizeMatched ?? response?.filled_size ?? -1);
-      if (matched === 0) {
-        console.log(`[poly-order]     FOK no fill (price moved)`);
-        throw new Error('Polymarket FOK: order not filled (price moved)');
-      }
-      console.log(`[poly-order]     OK matched=${matched}`);
-      return response;
-    } catch (err) {
-      lastErr = err;
-      const errMsg = err?.response?.data?.error || err?.message || '';
-      const status = err?.response?.status || '?';
-      console.log(`[poly-order]     CATCH (status ${status}): ${errMsg}`);
-      if (err?.response?.status === 401 || err?.response?.status === 403
-          || /invalid signature|order_version_mismatch|not authorized/i.test(errMsg)) continue;
-      throw err;
+    }
+    // If at least one attempt failed with something OTHER than version_mismatch, flipping
+    // negRisk likely won't help — bail out instead of wasting another full sweep.
+    if (!allVersionMismatch) break;
+    if (tryNegRisk === negRiskTries[0]) {
+      console.log(`[poly-order] all sigTypes failed with order_version_mismatch — retrying with negRisk=${!tryNegRisk}`);
     }
   }
   console.log(`[poly-order] all attempts failed; final error: ${lastErr?.message}`);
