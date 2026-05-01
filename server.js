@@ -1374,12 +1374,12 @@ async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price,
     : wallet.address.toLowerCase();
   const isProxy = funder !== wallet.address.toLowerCase();
   const tokenIdStr = normalizePolyTokenId(tokenId) || String(tokenId).trim();
-  const attempts = [
-    { sigType: 0, funderAddr: wallet.address },
-    ...(isProxy
-      ? [{ sigType: 1, funderAddr: funder }, { sigType: 2, funderAddr: funder }]
-      : [{ sigType: 1, funderAddr: wallet.address }, { sigType: 2, funderAddr: wallet.address }]),
-  ];
+  // For Magic/Gmail signups (Gnosis Safe proxy), sigType=2 is the right one — try it FIRST
+  // when funder is a proxy. For MetaMask-created Polymarket Proxies, sigType=1 works.
+  // EOA-only goes last as a fallback.
+  const attempts = isProxy
+    ? [{ sigType: 2, funderAddr: funder }, { sigType: 1, funderAddr: funder }, { sigType: 0, funderAddr: wallet.address }]
+    : [{ sigType: 0, funderAddr: wallet.address }, { sigType: 1, funderAddr: wallet.address }, { sigType: 2, funderAddr: wallet.address }];
   // Simulate market orders with FOK at aggressive prices — no orderbook fetch needed (faster).
   // BUY: use 0.99 (max price, fills against any seller). SELL: use 0.01 (min price, fills against any buyer).
   // FOK ensures full fill or nothing — no partial resting orders.
@@ -1404,7 +1404,9 @@ async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price,
       const responseErr = response?.error || response?.errorMsg;
       if (responseErr) {
         lastErr = new Error(String(responseErr));
-        if (/invalid signature/i.test(String(responseErr))) continue;
+        // Sig-type errors: try the next sigType. order_version_mismatch is what Polymarket
+        // returns when a Gnosis Safe (Magic/Gmail) account is signed as a Polymarket Proxy.
+        if (/invalid signature|order_version_mismatch|not authorized/i.test(String(responseErr))) continue;
         throw lastErr;
       }
       // FOK: if size_matched is 0 the order was cancelled (price moved, no fill)
@@ -1414,7 +1416,8 @@ async function placePolymarketOrderDirect(polyCreds, polyFunder, tokenId, price,
     } catch (err) {
       lastErr = err;
       const errMsg = err?.response?.data?.error || err?.message || '';
-      if (err?.response?.status === 401 || err?.response?.status === 403 || /invalid signature/i.test(errMsg)) continue;
+      if (err?.response?.status === 401 || err?.response?.status === 403
+          || /invalid signature|order_version_mismatch|not authorized/i.test(errMsg)) continue;
       throw err;
     }
   }
@@ -1473,10 +1476,10 @@ function extractPolyFillPrice(polyResp) {
   return null;
 }
 // Extract the actual fill price (in cents) from a Kalshi order response.
-// Pre-flight Polymarket allowance check. Returns { balanceUsdc, allowanceUsdc, ok, hint } or null on error.
-// `ok` = balance is 0 (nothing to trade) OR allowance >= balance (configured fine).
-// Used by auto-arb engine startup and /api/arb/execute to fail-fast instead of looping
-// through doomed orders when the user hasn't enabled USDC allowance via polymarket.com.
+// Polymarket allowance reader. Tries all sigTypes and picks the highest allowance found
+// (sigType-dependent CLOB responses can disagree — Gmail/Magic accounts use Gnosis Safe via
+// sigType=2 while MetaMask accounts use Polymarket Proxy via sigType=1). Returns
+// { balanceUsdc, allowanceUsdc, ok, hint, walletAddress } or null on error.
 async function checkPolyAllowance(credsPoly, polyFunder) {
   if (!credsPoly?.privateKey) return null;
   try {
@@ -1492,23 +1495,35 @@ async function checkPolyAllowance(credsPoly, polyFunder) {
       ? String(polyFunder).trim().toLowerCase()
       : wallet.address.toLowerCase();
     const isProxy = funder !== wallet.address.toLowerCase();
-    const sigOrder = isProxy ? [1, 0, 2] : [0, 1, 2];
+    const sigOrder = isProxy ? [2, 1, 0] : [0, 1, 2];
+
+    let bestBalance = 0;
+    let bestAllowance = 0;
+    let lastErr = null;
     for (const sigType of sigOrder) {
-      const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funder);
-      const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-      const balanceUsdc = Number(BigInt(bal?.balance ?? 0)) / 1e6;
-      const allowanceUsdc = Number(BigInt(bal?.allowance ?? 0)) / 1e6;
-      if (balanceUsdc > 0) {
-        const ok = allowanceUsdc >= balanceUsdc;
-        const hint = ok
-          ? null
-          : (allowanceUsdc === 0
-              ? 'USDC allowance is 0. Place one tiny trade on polymarket.com to enable allowance — Magic-key sessions cannot set allowance through this app.'
-              : `USDC allowance (${allowanceUsdc.toFixed(2)}) < balance (${balanceUsdc.toFixed(2)}). Re-enable allowance via polymarket.com.`);
-        return { balanceUsdc, allowanceUsdc, ok, hint, walletAddress: funder };
+      try {
+        const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funder);
+        const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        const balanceUsdc = Number(BigInt(bal?.balance ?? 0)) / 1e6;
+        const allowanceUsdc = Number(BigInt(bal?.allowance ?? 0)) / 1e6;
+        // Take the maximum across sigTypes — different sigTypes may map to different on-chain
+        // contract pairs (Safe vs Proxy) and only the right one will report real allowance.
+        if (balanceUsdc > bestBalance) bestBalance = balanceUsdc;
+        if (allowanceUsdc > bestAllowance) bestAllowance = allowanceUsdc;
+      } catch (err) {
+        lastErr = err;
       }
     }
-    return { balanceUsdc: 0, allowanceUsdc: 0, ok: true, hint: 'Balance is $0', walletAddress: funder };
+    if (bestBalance === 0 && lastErr) {
+      return { error: lastErr.message, ok: false, hint: `Could not read balance: ${lastErr.message}` };
+    }
+    const ok = bestBalance === 0 || bestAllowance >= bestBalance;
+    const hint = ok
+      ? null
+      : (bestAllowance === 0
+          ? 'USDC allowance reads 0 across all sigTypes. If you can trade on polymarket.com this is likely a CLOB cache lag — try anyway and we will let the order layer decide.'
+          : `USDC allowance (${bestAllowance.toFixed(2)}) < balance (${bestBalance.toFixed(2)}).`);
+    return { balanceUsdc: bestBalance, allowanceUsdc: bestAllowance, ok, hint, walletAddress: funder };
   } catch (err) {
     console.error('[allowance-check] error:', err.message);
     return { error: err.message, ok: false, hint: `Could not verify allowance: ${err.message}` };
@@ -2100,10 +2115,10 @@ async function placePolyOrderDirect(creds, funder, { tokenId, side, price, size,
   const apiCreds = { key: creds.apiKey, secret: creds.secret, passphrase: creds.passphrase };
   const effectiveFunder = funder || wallet.address;
   const isProxy = effectiveFunder.toLowerCase() !== wallet.address.toLowerCase();
-  const attempts = [
-    { sigType: 0, funderAddr: wallet.address },
-    ...(isProxy ? [{ sigType: 1, funderAddr: effectiveFunder }] : [{ sigType: 1, funderAddr: wallet.address }]),
-  ];
+  // Magic/Gmail signups use Gnosis Safe → sigType=2 first. Then sigType=1 (Poly Proxy), then EOA.
+  const attempts = isProxy
+    ? [{ sigType: 2, funderAddr: effectiveFunder }, { sigType: 1, funderAddr: effectiveFunder }, { sigType: 0, funderAddr: wallet.address }]
+    : [{ sigType: 0, funderAddr: wallet.address }, { sigType: 1, funderAddr: wallet.address }, { sigType: 2, funderAddr: wallet.address }];
   const tokenIdStr = String(tokenId).trim();
   const sideVal = String(side).toUpperCase() === 'SELL' ? Side.SELL : Side.BUY;
   const priceRounded = roundPriceToTick(price, tickSize || '0.01');
@@ -2121,13 +2136,14 @@ async function placePolyOrderDirect(creds, funder, { tokenId, side, price, size,
       const responseErr = response?.error || response?.errorMsg;
       if (responseErr) {
         lastErr = new Error(String(responseErr));
-        if (/invalid signature/i.test(String(responseErr))) continue;
+        // order_version_mismatch = Magic/Safe account signed as Polymarket Proxy (wrong sigType)
+        if (/invalid signature|order_version_mismatch|not authorized/i.test(String(responseErr))) continue;
         return { error: String(responseErr) };
       }
       return response;
     } catch (err) {
       lastErr = err;
-      if (/invalid signature/i.test(err?.message || '')) continue;
+      if (/invalid signature|order_version_mismatch|not authorized/i.test(err?.message || '')) continue;
       return { error: err?.message || 'Poly order failed' };
     }
   }
@@ -2456,17 +2472,9 @@ app.post('/api/arb/execute', async (req, res) => {
     });
   }
 
-  // Pre-flight: don't fire if USDC allowance is missing — the order will fail with a misleading
-  // order_version_mismatch and the rollback will eat your spread for nothing.
-  const allowance = await checkPolyAllowance(credsPoly, req.session?.polyFunder || null);
-  if (allowance && !allowance.ok && allowance.balanceUsdc > 0) {
-    return res.status(412).json({
-      error: `Polymarket order would fail: ${allowance.hint}`,
-      balanceUsdc: allowance.balanceUsdc,
-      allowanceUsdc: allowance.allowanceUsdc,
-      walletAddress: allowance.walletAddress,
-    });
-  }
+  // Allowance pre-flight removed: CLOB's getBalanceAllowance returns 0 for Magic/Safe
+  // accounts even when allowance is actually set on-chain, causing false-positive blocks.
+  // The order layer retries through all sigTypes — let it decide.
 
   try {
     const result = await executeArb(opp, credsPoly, credsKal, req.session?.polyFunder || null);
@@ -2585,26 +2593,28 @@ app.get('/api/balances', async (req, res) => {
       let balanceUsdc = 0;
       let allowanceUsdc = 0;
       const isProxy = funder !== wallet.address.toLowerCase();
-      const sigOrder = isProxy ? [1, 0, 2] : [0, 1, 2];
+      // Magic/Gmail (Gnosis Safe) → sigType=2 first; MetaMask Polymarket Proxy → sigType=1.
+      const sigOrder = isProxy ? [2, 1, 0] : [0, 1, 2];
+      // Take the MAX balance and allowance across sigTypes. Different sigTypes can return
+      // different views; only the correct one shows real allowance for Magic/Safe accounts.
       for (const sigType of sigOrder) {
-        const client = new ClobClient(
-          'https://clob.polymarket.com',
-          137,
-          wallet,
-          apiCreds,
-          sigType,
-          funder
-        );
-        const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-        const balanceWei = BigInt(bal?.balance ?? 0);
-        const allowanceWei = BigInt(bal?.allowance ?? 0);
-        const usdc = Number(balanceWei) / 1e6;
-        const allowUsdc = Number(allowanceWei) / 1e6;
-        if (usdc > 0) {
-          balanceUsdc = usdc;
-          allowanceUsdc = allowUsdc;
-          break;
-        }
+        try {
+          const client = new ClobClient(
+            'https://clob.polymarket.com',
+            137,
+            wallet,
+            apiCreds,
+            sigType,
+            funder
+          );
+          const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+          const balanceWei = BigInt(bal?.balance ?? 0);
+          const allowanceWei = BigInt(bal?.allowance ?? 0);
+          const usdc = Number(balanceWei) / 1e6;
+          const allowUsdc = Number(allowanceWei) / 1e6;
+          if (usdc > balanceUsdc) balanceUsdc = usdc;
+          if (allowUsdc > allowanceUsdc) allowanceUsdc = allowUsdc;
+        } catch (_) { /* keep trying other sigTypes */ }
       }
       const needAllowance = balanceUsdc > 0 && allowanceUsdc < balanceUsdc;
       result.polymarket = {
@@ -3759,16 +3769,12 @@ app.post('/api/arb/auto/start', async (req, res) => {
   if (!simulate) {
     if (!req.session?.polyCreds) return res.status(401).json({ error: 'Sign in to Polymarket first' });
     if (!req.session?.kalshiCreds) return res.status(401).json({ error: 'Sign in to Kalshi first' });
-    // Pre-flight: refuse to start if USDC allowance is unset. Saves the user from watching
-    // the engine loop through order_version_mismatch errors that are actually allowance errors.
+    // Pre-flight: log allowance state but don't block. The CLOB's getBalanceAllowance can
+    // return 0 even when on-chain allowance is fine (sigType-dependent caching), so blocking
+    // here yields false positives. The order layer retries through all sigTypes anyway.
     const allowance = await checkPolyAllowance(req.session.polyCreds, req.session.polyFunder);
     if (allowance && !allowance.ok && allowance.balanceUsdc > 0) {
-      return res.status(412).json({
-        error: `Cannot start auto-arb: ${allowance.hint}`,
-        balanceUsdc: allowance.balanceUsdc,
-        allowanceUsdc: allowance.allowanceUsdc,
-        walletAddress: allowance.walletAddress,
-      });
+      console.warn('[AutoArb] Allowance check warning:', allowance.hint);
     }
   }
   if (autoArbEngine.running) return res.json({ ok: true, message: 'Auto-arb engine already running' });
