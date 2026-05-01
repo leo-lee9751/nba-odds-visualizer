@@ -1473,11 +1473,66 @@ function extractPolyFillPrice(polyResp) {
   return null;
 }
 // Extract the actual fill price (in cents) from a Kalshi order response.
+// Pre-flight Polymarket allowance check. Returns { balanceUsdc, allowanceUsdc, ok, hint } or null on error.
+// `ok` = balance is 0 (nothing to trade) OR allowance >= balance (configured fine).
+// Used by auto-arb engine startup and /api/arb/execute to fail-fast instead of looping
+// through doomed orders when the user hasn't enabled USDC allowance via polymarket.com.
+async function checkPolyAllowance(credsPoly, polyFunder) {
+  if (!credsPoly?.privateKey) return null;
+  try {
+    const { ClobClient, AssetType } = await import('@polymarket/clob-client');
+    const { Wallet } = await import('ethers');
+    const wallet = new Wallet(String(credsPoly.privateKey).trim());
+    const apiCreds = {
+      key: String(credsPoly.apiKey ?? '').trim(),
+      secret: String(credsPoly.secret ?? '').trim(),
+      passphrase: String(credsPoly.passphrase ?? '').trim(),
+    };
+    const funder = (polyFunder && /^0x[a-fA-F0-9]{40}$/.test(String(polyFunder)))
+      ? String(polyFunder).trim().toLowerCase()
+      : wallet.address.toLowerCase();
+    const isProxy = funder !== wallet.address.toLowerCase();
+    const sigOrder = isProxy ? [1, 0, 2] : [0, 1, 2];
+    for (const sigType of sigOrder) {
+      const client = new ClobClient('https://clob.polymarket.com', 137, wallet, apiCreds, sigType, funder);
+      const bal = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+      const balanceUsdc = Number(BigInt(bal?.balance ?? 0)) / 1e6;
+      const allowanceUsdc = Number(BigInt(bal?.allowance ?? 0)) / 1e6;
+      if (balanceUsdc > 0) {
+        const ok = allowanceUsdc >= balanceUsdc;
+        const hint = ok
+          ? null
+          : (allowanceUsdc === 0
+              ? 'USDC allowance is 0. Place one tiny trade on polymarket.com to enable allowance — Magic-key sessions cannot set allowance through this app.'
+              : `USDC allowance (${allowanceUsdc.toFixed(2)}) < balance (${balanceUsdc.toFixed(2)}). Re-enable allowance via polymarket.com.`);
+        return { balanceUsdc, allowanceUsdc, ok, hint, walletAddress: funder };
+      }
+    }
+    return { balanceUsdc: 0, allowanceUsdc: 0, ok: true, hint: 'Balance is $0', walletAddress: funder };
+  } catch (err) {
+    console.error('[allowance-check] error:', err.message);
+    return { error: err.message, ok: false, hint: `Could not verify allowance: ${err.message}` };
+  }
+}
+
 function extractKalshiFillCents(kalshiResp) {
   const order = kalshiResp?.order ?? kalshiResp ?? {};
-  // Kalshi response includes filled_count and the avg fill price varies by API version.
-  const yes = Number(order.yes_price ?? order.fill_price ?? order.avg_fill_price);
+  // Real fill price = taker_fill_cost / taker_fill_count. Both are in the order response when
+  // an aggressive limit order matches against resting liquidity (our usual path).
+  const cost = Number(order.taker_fill_cost);
+  const count = Number(order.taker_fill_count);
+  if (Number.isFinite(cost) && Number.isFinite(count) && count > 0) {
+    return Math.round((cost / count) * 10) / 10; // 1 decimal place
+  }
+  // Fallback for older response shapes / rare API variants.
+  const yes = Number(order.fill_price ?? order.avg_fill_price);
   if (Number.isFinite(yes) && yes > 0 && yes < 100) return yes;
+  // Last resort: yes_price (just the limit we sent — overstates the price for BUYs at 99c, etc.)
+  // Only return this if the order clearly executed.
+  if (String(order.status).toLowerCase() === 'executed') {
+    const limit = Number(order.yes_price);
+    if (Number.isFinite(limit) && limit > 0 && limit < 100) return limit;
+  }
   return null;
 }
 
@@ -2398,6 +2453,18 @@ app.post('/api/arb/execute', async (req, res) => {
   if (polyNotional < 1) {
     return res.status(400).json({
       error: `Polymarket minimum order is $1 notional. This arb stake would be $${polyNotional.toFixed(2)}. Increase ARB_MAX_STAKE_PER_ARB_USD or choose a larger opportunity.`,
+    });
+  }
+
+  // Pre-flight: don't fire if USDC allowance is missing — the order will fail with a misleading
+  // order_version_mismatch and the rollback will eat your spread for nothing.
+  const allowance = await checkPolyAllowance(credsPoly, req.session?.polyFunder || null);
+  if (allowance && !allowance.ok && allowance.balanceUsdc > 0) {
+    return res.status(412).json({
+      error: `Polymarket order would fail: ${allowance.hint}`,
+      balanceUsdc: allowance.balanceUsdc,
+      allowanceUsdc: allowance.allowanceUsdc,
+      walletAddress: allowance.walletAddress,
     });
   }
 
@@ -3687,11 +3754,22 @@ app.get('/api/arb/auto/stream', (req, res) => {
   req.on('close', () => autoArbEngine.sseClients.delete(res));
 });
 
-app.post('/api/arb/auto/start', (req, res) => {
+app.post('/api/arb/auto/start', async (req, res) => {
   const { simulate = false, simBalancePoly = 1000, simBalanceKal = 1000, maxStakeUsd, exitThreshold, sport = 'nba' } = req.body || {};
   if (!simulate) {
     if (!req.session?.polyCreds) return res.status(401).json({ error: 'Sign in to Polymarket first' });
     if (!req.session?.kalshiCreds) return res.status(401).json({ error: 'Sign in to Kalshi first' });
+    // Pre-flight: refuse to start if USDC allowance is unset. Saves the user from watching
+    // the engine loop through order_version_mismatch errors that are actually allowance errors.
+    const allowance = await checkPolyAllowance(req.session.polyCreds, req.session.polyFunder);
+    if (allowance && !allowance.ok && allowance.balanceUsdc > 0) {
+      return res.status(412).json({
+        error: `Cannot start auto-arb: ${allowance.hint}`,
+        balanceUsdc: allowance.balanceUsdc,
+        allowanceUsdc: allowance.allowanceUsdc,
+        walletAddress: allowance.walletAddress,
+      });
+    }
   }
   if (autoArbEngine.running) return res.json({ ok: true, message: 'Auto-arb engine already running' });
   autoArbEngine.simulate = Boolean(simulate);
